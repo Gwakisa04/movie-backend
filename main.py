@@ -1,7 +1,7 @@
 """
 EVC - E-Video Cloud Backend API
-FastAPI backend for movie data retrieval from OMDB, TMDB, and TVMaze APIs
-Combines results from all three APIs for maximum movie coverage
+FastAPI backend for movie data retrieval from OMDB, TMDB, TVMaze, WatchMode, and YouTube APIs
+Combines results from all five APIs for maximum movie coverage with trailers, streaming links, and music videos
 """
 
 from fastapi import FastAPI, HTTPException, Query
@@ -26,6 +26,14 @@ TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
 
 # TVMaze API Configuration (Free, no API key required)
 TVMAZE_BASE_URL = "https://api.tvmaze.com"
+
+# WatchMode API Configuration (for trailers and streaming platform links)
+WATCHMODE_API_KEY = os.environ.get("WATCHMODE_API_KEY", "YH05AmtNmPZLFuvBziKL2XvKJmNJHsCLEvHy4EXx")
+WATCHMODE_BASE_URL = "https://api.watchmode.com/v1"
+
+# YouTube Data API Configuration (for music videos and trailers)
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "AIzaSyCvjc895h-fmSW3ZMn-jy3wWtHk4wH3fx8")
+YOUTUBE_BASE_URL = "https://www.googleapis.com/youtube/v3"
 
 # In-memory cache for API responses (in production, use Redis)
 cache = {}
@@ -589,6 +597,286 @@ class TVMazeClient:
         await self.client.aclose()
 
 
+class WatchModeClient:
+    """Client for interacting with WatchMode API for trailers and streaming platform links"""
+    
+    def __init__(self, api_key: str, base_url: str):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.client = httpx.AsyncClient(
+            timeout=10.0,
+            headers={
+                "accept": "application/json"
+            }
+        )
+    
+    async def search_titles(self, query: str, search_type: str = "movie") -> List[dict]:
+        """Search for movies/TV shows by title"""
+        cache_key = f"watchmode_search:{query}:{search_type}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            url = f"{self.base_url}/search/"
+            params = {
+                "apiKey": self.api_key,
+                "search_field": "name",
+                "search_value": query,
+                "types": search_type  # movie, tv_series, etc.
+            }
+            
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            results = data.get("title_results", [])
+            
+            # Cache the response
+            cache[cache_key] = (results, datetime.now())
+            
+            return results
+        except httpx.HTTPError as e:
+            return []
+    
+    async def get_title_details(self, title_id: int) -> Optional[dict]:
+        """Get detailed information about a title including trailer"""
+        cache_key = f"watchmode_details:{title_id}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            url = f"{self.base_url}/title/{title_id}/details/"
+            params = {"apiKey": self.api_key}
+            
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Cache the response
+            cache[cache_key] = (data, datetime.now())
+            
+            return data
+        except httpx.HTTPError as e:
+            return None
+    
+    async def get_title_sources(self, title_id: int) -> List[dict]:
+        """Get streaming platform sources for a title"""
+        cache_key = f"watchmode_sources:{title_id}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            url = f"{self.base_url}/title/{title_id}/sources/"
+            params = {"apiKey": self.api_key}
+            
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            sources = data if isinstance(data, list) else []
+            
+            # Cache the response (shorter cache for sources as they change frequently)
+            cache[cache_key] = (sources, datetime.now())
+            
+            return sources
+        except httpx.HTTPError as e:
+            return []
+    
+    async def enrich_movie_with_watchmode(self, movie: dict) -> dict:
+        """Enrich a movie object with WatchMode data (trailer and streaming sources)"""
+        # Try to find the movie in WatchMode by title
+        title = movie.get("Title", "")
+        if not title:
+            return movie
+        
+        # Search for the title
+        watchmode_results = await self.search_titles(title)
+        
+        if not watchmode_results:
+            return movie
+        
+        # Use the first result (best match)
+        watchmode_title = watchmode_results[0]
+        title_id = watchmode_title.get("id")
+        
+        if not title_id:
+            return movie
+        
+        # Get details and sources concurrently
+        details_task = self.get_title_details(title_id)
+        sources_task = self.get_title_sources(title_id)
+        
+        details, sources = await asyncio.gather(
+            details_task,
+            sources_task,
+            return_exceptions=True
+        )
+        
+        # Add WatchMode data to movie
+        if isinstance(details, dict):
+            movie["trailer"] = details.get("trailer")
+            movie["watchmode_id"] = title_id
+            movie["watchmode_imdb_id"] = details.get("imdb_id")
+            movie["watchmode_tmdb_id"] = details.get("tmdb_id")
+            movie["watchmode_tmdb_type"] = details.get("tmdb_type")
+        
+        if isinstance(sources, list):
+            # Group sources by type
+            streaming_sources = []
+            for source in sources:
+                streaming_sources.append({
+                    "name": source.get("name"),
+                    "type": source.get("type"),  # free, subscription, rental, buy
+                    "web_url": source.get("web_url"),
+                    "ios_url": source.get("ios_url"),
+                    "android_url": source.get("android_url"),
+                    "format": source.get("format"),  # sd, hd, 4k
+                    "price": source.get("price"),
+                    "season": source.get("season"),
+                    "episode": source.get("episode")
+                })
+            movie["streaming_sources"] = streaming_sources
+        
+        return movie
+    
+    async def close(self):
+        """Close the HTTP client"""
+        await self.client.aclose()
+
+
+class YouTubeClient:
+    """Client for interacting with YouTube Data API v3 for music videos and trailers"""
+    
+    def __init__(self, api_key: str, base_url: str):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.client = httpx.AsyncClient(
+            timeout=10.0,
+            headers={
+                "accept": "application/json"
+            }
+        )
+    
+    async def search_videos(
+        self, 
+        query: str, 
+        max_results: int = 10,
+        video_category: Optional[str] = None,
+        video_type: str = "video"
+    ) -> List[dict]:
+        """Search for videos on YouTube"""
+        cache_key = f"youtube_search:{query}:{max_results}:{video_category}:{video_type}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            url = f"{self.base_url}/search"
+            params = {
+                "key": self.api_key,
+                "part": "snippet",
+                "q": query,
+                "type": video_type,
+                "maxResults": max_results,
+                "order": "relevance"
+            }
+            
+            # Add video category for music videos (categoryId=10)
+            if video_category == "music":
+                params["videoCategoryId"] = "10"
+            
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            videos = []
+            for item in data.get("items", []):
+                video_id = item.get("id", {}).get("videoId")
+                snippet = item.get("snippet", {})
+                
+                videos.append({
+                    "video_id": video_id,
+                    "title": snippet.get("title"),
+                    "description": snippet.get("description"),
+                    "thumbnail": snippet.get("thumbnails", {}).get("high", {}).get("url") or snippet.get("thumbnails", {}).get("medium", {}).get("url"),
+                    "channel_title": snippet.get("channelTitle"),
+                    "published_at": snippet.get("publishedAt"),
+                    "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else None,
+                    "embed_url": f"https://www.youtube.com/embed/{video_id}" if video_id else None
+                })
+            
+            # Cache the response
+            cache[cache_key] = (videos, datetime.now())
+            
+            return videos
+        except httpx.HTTPError as e:
+            return []
+    
+    async def search_music_videos(self, query: str, max_results: int = 10) -> List[dict]:
+        """Search specifically for music videos"""
+        return await self.search_videos(query, max_results, video_category="music")
+    
+    async def search_trailers(self, movie_title: str, year: Optional[str] = None, max_results: int = 5) -> List[dict]:
+        """Search for movie trailers on YouTube"""
+        query = f"{movie_title} trailer"
+        if year:
+            query += f" {year}"
+        
+        return await self.search_videos(query, max_results, video_type="video")
+    
+    async def enrich_movie_with_youtube(self, movie: dict) -> dict:
+        """Enrich a movie object with YouTube videos (trailers and music)"""
+        title = movie.get("Title", "")
+        year = movie.get("Year", "")
+        
+        if not title:
+            return movie
+        
+        # Search for trailers and music videos concurrently
+        trailer_query = f"{title} trailer {year}" if year else f"{title} trailer"
+        music_query = f"{title} soundtrack {year}" if year else f"{title} soundtrack"
+        
+        trailers_task = self.search_trailers(title, year, max_results=3)
+        music_task = self.search_music_videos(music_query, max_results=5)
+        
+        trailers, music_videos = await asyncio.gather(
+            trailers_task,
+            music_task,
+            return_exceptions=True
+        )
+        
+        # Add YouTube data to movie
+        if isinstance(trailers, list) and trailers:
+            movie["youtube_trailers"] = trailers
+            # Set primary trailer URL if not already set from WatchMode
+            if not movie.get("trailer") and trailers:
+                movie["trailer"] = trailers[0].get("url")
+        
+        if isinstance(music_videos, list) and music_videos:
+            movie["youtube_music_videos"] = music_videos
+        
+        return movie
+    
+    async def close(self):
+        """Close the HTTP client"""
+        await self.client.aclose()
+
+
 def merge_movie_results(omdb_movies: List[dict], tmdb_movies: List[dict], tvmaze_shows: List[dict] = None, limit: int = 20) -> List[dict]:
     """Merge and deduplicate movie results from all three APIs"""
     seen_titles = set()
@@ -629,15 +917,19 @@ def merge_movie_results(omdb_movies: List[dict], tmdb_movies: List[dict], tvmaze
 omdb_client = None
 tmdb_client = None
 tvmaze_client = None
+watchmode_client = None
+youtube_client = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global omdb_client, tmdb_client, tvmaze_client
+    global omdb_client, tmdb_client, tvmaze_client, watchmode_client, youtube_client
     omdb_client = OMDBClient(OMDB_API_KEY, OMDB_BASE_URL)
     tmdb_client = TMDBClient(TMDB_ACCESS_TOKEN, TMDB_BASE_URL)
     tvmaze_client = TVMazeClient(TVMAZE_BASE_URL)
+    watchmode_client = WatchModeClient(WATCHMODE_API_KEY, WATCHMODE_BASE_URL)
+    youtube_client = YouTubeClient(YOUTUBE_API_KEY, YOUTUBE_BASE_URL)
     yield
     # Shutdown
     if omdb_client:
@@ -646,6 +938,10 @@ async def lifespan(app: FastAPI):
         await tmdb_client.close()
     if tvmaze_client:
         await tvmaze_client.close()
+    if watchmode_client:
+        await watchmode_client.close()
+    if youtube_client:
+        await youtube_client.close()
 
 
 app = FastAPI(
@@ -910,12 +1206,131 @@ async def get_new_releases(
 
 
 @app.get("/api/movies/{imdb_id}")
-async def get_movie(imdb_id: str):
-    """Get movie details by IMDb ID"""
+async def get_movie(
+    imdb_id: str, 
+    include_watchmode: bool = Query(True, description="Include WatchMode data (trailers and streaming sources)"),
+    include_youtube: bool = Query(True, description="Include YouTube data (trailers and music videos)")
+):
+    """Get movie details by IMDb ID with optional WatchMode and YouTube enrichment"""
     try:
         result = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=True)
         if result is None:
             raise HTTPException(status_code=404, detail="Movie not found")
+        
+        # Enrich with WatchMode data if requested
+        if include_watchmode:
+            try:
+                result = await watchmode_client.enrich_movie_with_watchmode(result)
+            except Exception as e:
+                # If WatchMode fails, continue without it
+                print(f"WatchMode enrichment failed: {str(e)}")
+        
+        # Enrich with YouTube data if requested
+        if include_youtube:
+            try:
+                result = await youtube_client.enrich_movie_with_youtube(result)
+            except Exception as e:
+                # If YouTube fails, continue without it
+                print(f"YouTube enrichment failed: {str(e)}")
+        
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/movies/{imdb_id}/streaming")
+async def get_movie_streaming(imdb_id: str):
+    """Get streaming platform sources for a movie by IMDb ID"""
+    try:
+        # First get the movie to get the title
+        movie = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=True)
+        if movie is None:
+            raise HTTPException(status_code=404, detail="Movie not found")
+        
+        # Search for the movie in WatchMode
+        title = movie.get("Title", "")
+        if not title:
+            return {"streaming_sources": [], "trailer": None}
+        
+        watchmode_results = await watchmode_client.search_titles(title)
+        if not watchmode_results:
+            return {"streaming_sources": [], "trailer": None}
+        
+        # Get details and sources
+        title_id = watchmode_results[0].get("id")
+        if not title_id:
+            return {"streaming_sources": [], "trailer": None}
+        
+        details_task = watchmode_client.get_title_details(title_id)
+        sources_task = watchmode_client.get_title_sources(title_id)
+        
+        details, sources = await asyncio.gather(
+            details_task,
+            sources_task,
+            return_exceptions=True
+        )
+        
+        result = {
+            "streaming_sources": [],
+            "trailer": None
+        }
+        
+        if isinstance(details, dict):
+            result["trailer"] = details.get("trailer")
+        
+        if isinstance(sources, list):
+            result["streaming_sources"] = sources
+        
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/movies/{imdb_id}/youtube")
+async def get_movie_youtube(imdb_id: str, include_music: bool = Query(True, description="Include music videos")):
+    """Get YouTube videos (trailers and music) for a movie by IMDb ID"""
+    try:
+        # First get the movie to get the title
+        movie = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=True)
+        if movie is None:
+            raise HTTPException(status_code=404, detail="Movie not found")
+        
+        title = movie.get("Title", "")
+        year = movie.get("Year", "")
+        
+        if not title:
+            return {"youtube_trailers": [], "youtube_music_videos": []}
+        
+        # Search for trailers and optionally music videos
+        trailers_task = youtube_client.search_trailers(title, year, max_results=5)
+        
+        if include_music:
+            music_query = f"{title} soundtrack {year}" if year else f"{title} soundtrack"
+            music_task = youtube_client.search_music_videos(music_query, max_results=10)
+            trailers, music_videos = await asyncio.gather(
+                trailers_task,
+                music_task,
+                return_exceptions=True
+            )
+        else:
+            trailers = await trailers_task
+            music_videos = []
+        
+        result = {
+            "youtube_trailers": [],
+            "youtube_music_videos": []
+        }
+        
+        if isinstance(trailers, list):
+            result["youtube_trailers"] = trailers
+        
+        if isinstance(music_videos, list):
+            result["youtube_music_videos"] = music_videos
+        
         return result
     except HTTPException:
         raise
