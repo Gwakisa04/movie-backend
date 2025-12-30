@@ -2296,6 +2296,95 @@ async def search_music_videos(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/music/trending")
+async def get_trending_music_videos(
+    max_results: int = Query(50, ge=1, le=50, description="Maximum number of results")
+):
+    """Get trending music videos on YouTube"""
+    try:
+        # Use popular music search queries and sort by view count
+        trending_queries = [
+            "music",
+            "popular songs",
+            "top hits",
+            "latest music"
+        ]
+        
+        # Fetch from multiple queries and combine
+        all_videos = []
+        videos_per_query = (max_results // len(trending_queries)) + 5
+        
+        # Search with viewCount order for trending
+        tasks = []
+        for query in trending_queries:
+            cache_key = f"youtube_search:{query}:{videos_per_query}:music:video"
+            
+            # Check cache
+            if cache_key in cache:
+                cached_data, cached_time = cache[cache_key]
+                if datetime.now() - cached_time < CACHE_DURATION:
+                    tasks.append(cached_data)
+                    continue
+            
+            # Create task to search with viewCount order
+            url = f"{youtube_client.base_url}/search"
+            params = {
+                "key": youtube_client.api_key,
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "maxResults": videos_per_query,
+                "order": "viewCount",  # Sort by view count for trending
+                "videoCategoryId": "10"  # Music category
+            }
+            
+            tasks.append(youtube_client.client.get(url, params=params))
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        seen_video_ids = set()
+        for result in results:
+            if isinstance(result, list):
+                # Already processed cached data
+                for video in result:
+                    video_id = video.get("video_id")
+                    if video_id and video_id not in seen_video_ids:
+                        seen_video_ids.add(video_id)
+                        all_videos.append(video)
+            elif hasattr(result, 'json'):
+                # HTTP response - process it
+                try:
+                    data = result.json()
+                    for item in data.get("items", []):
+                        video_id = item.get("id", {}).get("videoId")
+                        if video_id and video_id not in seen_video_ids:
+                            snippet = item.get("snippet", {})
+                            seen_video_ids.add(video_id)
+                            all_videos.append({
+                                "video_id": video_id,
+                                "title": snippet.get("title"),
+                                "description": snippet.get("description"),
+                                "thumbnail": snippet.get("thumbnails", {}).get("high", {}).get("url") or snippet.get("thumbnails", {}).get("medium", {}).get("url"),
+                                "channel_title": snippet.get("channelTitle"),
+                                "published_at": snippet.get("publishedAt"),
+                                "url": f"https://www.youtube.com/watch?v={video_id}",
+                                "embed_url": f"https://www.youtube.com/embed/{video_id}"
+                            })
+                except:
+                    pass
+            
+            if len(all_videos) >= max_results:
+                break
+        
+        return {
+            "Response": "True",
+            "videos": all_videos[:max_results],
+            "totalResults": len(all_videos)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
