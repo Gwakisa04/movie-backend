@@ -22,7 +22,7 @@ OMDB_BASE_URL = "http://www.omdbapi.com/"
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "12bd7697a8d16869fabe58f6646611bd")
 TMDB_ACCESS_TOKEN = os.environ.get("TMDB_ACCESS_TOKEN", "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiIxMmJkNzY5N2E4ZDE2ODY5ZmFiZTU4ZjY2NDY2MTFiZCIsIm5iZiI6MTc2Njg2MzEwNC40NTUwMDAyLCJzdWIiOiI2OTUwMzEwMGMxY2U4NjJlMGUyZmJlZDciLCJzY29wZXMiOlsiYXBpX3JlYWQiXSwidmVyc2lvbiI6MX0.E0mtTw_3_zb_v1ZC6hrNUQPRQPXuDhrMpFw1lrz8PWM")
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
-TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
+TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w780"  # Higher quality images
 
 # TVMaze API Configuration (Free, no API key required)
 TVMAZE_BASE_URL = "https://api.tvmaze.com"
@@ -425,6 +425,85 @@ class TMDBClient:
             if raise_on_error:
                 raise HTTPException(status_code=500, detail=f"TMDB API error: {str(e)}")
             return None
+    
+    async def get_person_details(self, person_id: int) -> Optional[dict]:
+        """Get person (actor) details by TMDB ID"""
+        cache_key = f"tmdb_person:{person_id}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            url = f"{self.base_url}/person/{person_id}"
+            params = {"append_to_response": "images,combined_credits"}
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Cache the response
+            cache[cache_key] = (data, datetime.now())
+            
+            return data
+        except httpx.HTTPError as e:
+            return None
+    
+    async def search_people(self, query: str, page: int = 1) -> List[dict]:
+        """Search for people (actors) by name"""
+        cache_key = f"tmdb_people_search:{query}:{page}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            url = f"{self.base_url}/search/person"
+            params = {
+                "query": query,
+                "page": page
+            }
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            results = data.get("results", [])
+            
+            # Cache the response
+            cache[cache_key] = (results, datetime.now())
+            
+            return results
+        except httpx.HTTPError as e:
+            return []
+    
+    async def get_popular_people(self, page: int = 1) -> List[dict]:
+        """Get popular people (actors)"""
+        cache_key = f"tmdb_popular_people:{page}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            url = f"{self.base_url}/person/popular"
+            params = {"page": page}
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            results = data.get("results", [])
+            
+            # Cache the response
+            cache[cache_key] = (results, datetime.now())
+            
+            return results
+        except httpx.HTTPError as e:
+            return []
     
     async def close(self):
         """Close the HTTP client"""
@@ -1594,8 +1673,8 @@ async def search_movies(
         if isinstance(anilist_result, dict) and anilist_result.get("Response") == "True":
             anilist_items = anilist_result.get("Search", [])
         
-        # Merge results (limit to 20 per page)
-        merged_movies = merge_movie_results(omdb_movies, tmdb_movies, tvmaze_shows, anilist_items, limit=20)
+        # Merge results (limit to 50 per page)
+        merged_movies = merge_movie_results(omdb_movies, tmdb_movies, tvmaze_shows, anilist_items, limit=50)
         
         return {
             "Response": "True",
@@ -1954,7 +2033,7 @@ async def search_manga(
 
 @app.get("/api/manga/popular")
 async def get_popular_manga(
-    limit: int = Query(20, ge=1, le=100, description="Number of results")
+    limit: int = Query(50, ge=1, le=100, description="Number of results")
 ):
     """Get popular manga from AniList"""
     try:
@@ -1978,6 +2057,65 @@ async def get_anime_by_id(anilist_id: int):
         return result
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/actors/popular")
+async def get_popular_actors(page: int = Query(1, ge=1)):
+    """Get popular actors from TMDB"""
+    try:
+        actors = await tmdb_client.get_popular_people(page)
+        return {
+            "Response": "True",
+            "results": actors,
+            "page": page
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/actors/{person_id}")
+async def get_actor_details(person_id: int):
+    """Get actor details with biography and filmography from TMDB"""
+    try:
+        actor = await tmdb_client.get_person_details(person_id)
+        if actor is None:
+            raise HTTPException(status_code=404, detail="Actor not found")
+        return actor
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/actors/search")
+async def search_actors(query: str = Query(..., description="Search query for actors"), page: int = Query(1, ge=1)):
+    """Search for actors by name"""
+    try:
+        results = await tmdb_client.search_people(query, page)
+        return {
+            "Response": "True",
+            "results": results,
+            "page": page
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/music/search")
+async def search_music_videos(
+    query: str = Query(..., description="Search query for music videos"),
+    max_results: int = Query(20, ge=1, le=50, description="Maximum number of results")
+):
+    """Search for music videos on YouTube"""
+    try:
+        videos = await youtube_client.search_music_videos(query, max_results)
+        return {
+            "Response": "True",
+            "videos": videos,
+            "totalResults": len(videos)
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
