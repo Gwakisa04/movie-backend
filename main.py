@@ -1,7 +1,7 @@
 """
 EVC - E-Video Cloud Backend API
-FastAPI backend for movie data retrieval from OMDB and TMDB APIs
-Combines results from both APIs for maximum movie coverage
+FastAPI backend for movie data retrieval from OMDB, TMDB, and TVMaze APIs
+Combines results from all three APIs for maximum movie coverage
 """
 
 from fastapi import FastAPI, HTTPException, Query
@@ -23,6 +23,9 @@ TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "12bd7697a8d16869fabe58f6646611bd"
 TMDB_ACCESS_TOKEN = os.environ.get("TMDB_ACCESS_TOKEN", "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiIxMmJkNzY5N2E4ZDE2ODY5ZmFiZTU4ZjY2NDY2MTFiZCIsIm5iZiI6MTc2Njg2MzEwNC40NTUwMDAyLCJzdWIiOiI2OTUwMzEwMGMxY2U4NjJlMGUyZmJlZDciLCJzY29wZXMiOlsiYXBpX3JlYWQiXSwidmVyc2lvbiI6MX0.E0mtTw_3_zb_v1ZC6hrNUQPRQPXuDhrMpFw1lrz8PWM")
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w500"
+
+# TVMaze API Configuration (Free, no API key required)
+TVMAZE_BASE_URL = "https://api.tvmaze.com"
 
 # In-memory cache for API responses (in production, use Redis)
 cache = {}
@@ -417,8 +420,177 @@ class TMDBClient:
         await self.client.aclose()
 
 
-def merge_movie_results(omdb_movies: List[dict], tmdb_movies: List[dict], limit: int) -> List[dict]:
-    """Merge and deduplicate movie results from both APIs"""
+class TVMazeClient:
+    """Client for interacting with TVMaze API with caching (Free, no API key required)"""
+    
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+        self.client = httpx.AsyncClient(
+            timeout=10.0,
+            headers={
+                "accept": "application/json",
+                "User-Agent": "EVC-API/1.0"  # Recommended by TVMaze
+            }
+        )
+    
+    def _normalize_tvmaze_to_omdb_format(self, tvmaze_item: dict, item_type: str = "series") -> dict:
+        """Convert TVMaze show format to OMDB-like format for consistency"""
+        show = tvmaze_item.get("show", tvmaze_item)  # Search results wrap in "show" key
+        
+        # Extract image URL
+        image_url = "N/A"
+        if show.get("image"):
+            image_url = show["image"].get("medium") or show["image"].get("original", "N/A")
+        
+        # Extract year from premiered date
+        year = "N/A"
+        if show.get("premiered"):
+            year = str(show["premiered"])[:4]
+        
+        # Get IMDb ID if available
+        imdb_id = show.get("externals", {}).get("imdb", "")
+        if not imdb_id:
+            imdb_id = f"tvmaze_{show.get('id')}"  # Use TVMaze ID as fallback
+        
+        return {
+            "Title": show.get("name", ""),
+            "Year": year,
+            "imdbID": imdb_id,
+            "Type": item_type,
+            "Poster": image_url,
+            "tvmaze_id": show.get("id"),
+            "tvmaze_rating": show.get("rating", {}).get("average"),
+            "overview": show.get("summary", "").replace("<p>", "").replace("</p>", "").replace("<b>", "").replace("</b>", "") if show.get("summary") else "",
+            "premiered": show.get("premiered"),
+            "genres": show.get("genres", []),
+            "runtime": show.get("runtime"),
+            "status": show.get("status"),
+            "source": "tvmaze"
+        }
+    
+    async def search_shows(
+        self,
+        query: str,
+        page: int = 1,
+        year: Optional[int] = None,
+        content_type: Optional[str] = None
+    ) -> dict:
+        """Search for TV shows by title"""
+        # TVMaze is primarily for TV shows, but we can use it for series/anime
+        if content_type == "movie":
+            # TVMaze doesn't have movies, skip for movie searches
+            return {"Response": "False", "Error": "TVMaze doesn't support movies", "Search": []}
+        
+        cache_key = f"tvmaze_search:{query}:{page}:{year}:{content_type}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        params = {"q": query}
+        
+        try:
+            url = f"{self.base_url}/search/shows"
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Normalize to OMDB-like format
+            normalized_results = []
+            for item in data:
+                # Determine item type
+                item_type = "series"
+                if content_type == "anime":
+                    # Check if it's anime based on genres
+                    show = item.get("show", item)
+                    genres = show.get("genres", [])
+                    if "Anime" in genres or "Animation" in genres:
+                        item_type = "anime"
+                
+                # Filter by year if specified
+                if year:
+                    show = item.get("show", item)
+                    premiered = show.get("premiered")
+                    if premiered:
+                        show_year = int(str(premiered)[:4])
+                        if show_year != year:
+                            continue
+                
+                normalized_results.append(self._normalize_tvmaze_to_omdb_format(item, item_type))
+            
+            # Apply pagination (TVMaze doesn't support pagination, so we do it manually)
+            start_idx = (page - 1) * 10
+            end_idx = start_idx + 10
+            paginated_results = normalized_results[start_idx:end_idx]
+            
+            result = {
+                "Response": "True",
+                "Search": paginated_results,
+                "totalResults": str(len(normalized_results))
+            }
+            
+            # Cache the response
+            cache[cache_key] = (result, datetime.now())
+            
+            return result
+        except httpx.HTTPError as e:
+            return {"Response": "False", "Error": f"TVMaze API error: {str(e)}", "Search": []}
+    
+    async def get_popular_shows(self, limit: int = 20, content_type: Optional[str] = None) -> List[dict]:
+        """Get popular TV shows from TVMaze by searching popular terms"""
+        if content_type == "movie":
+            return []  # TVMaze doesn't have movies
+        
+        cache_key = f"tvmaze_popular:{limit}:{content_type}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data.get("results", [])[:limit]
+        
+        # Search for popular TV show terms
+        popular_queries = [
+            "the", "game", "house", "love", "man", "woman", "city", "night", "day",
+            "breaking", "walking", "stranger", "crown", "office", "friends"
+        ]
+        
+        all_shows = []
+        seen_ids = set()
+        
+        # Fetch shows from multiple popular queries
+        tasks = [self.search_shows(query, page=1, content_type=content_type) for query in popular_queries[:5]]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for result in results:
+            if isinstance(result, dict) and result.get("Response") == "True":
+                shows = result.get("Search", [])
+                for show in shows:
+                    tvmaze_id = show.get("tvmaze_id")
+                    if tvmaze_id and tvmaze_id not in seen_ids:
+                        seen_ids.add(tvmaze_id)
+                        all_shows.append(show)
+                        if len(all_shows) >= limit:
+                            break
+            if len(all_shows) >= limit:
+                break
+        
+        shows_list = all_shows[:limit]
+        
+        # Cache the response
+        cache[cache_key] = ({"results": shows_list}, datetime.now())
+        
+        return shows_list
+    
+    async def close(self):
+        """Close the HTTP client"""
+        await self.client.aclose()
+
+
+def merge_movie_results(omdb_movies: List[dict], tmdb_movies: List[dict], tvmaze_shows: List[dict] = None, limit: int = 20) -> List[dict]:
+    """Merge and deduplicate movie results from all three APIs"""
     seen_titles = set()
     merged = []
     
@@ -440,26 +612,40 @@ def merge_movie_results(omdb_movies: List[dict], tmdb_movies: List[dict], limit:
             if len(merged) >= limit:
                 return merged[:limit]
     
+    # Add TVMaze shows that aren't duplicates (if provided)
+    if tvmaze_shows:
+        for show in tvmaze_shows:
+            title_key = show.get("Title", "").lower().strip()
+            if title_key and title_key not in seen_titles:
+                seen_titles.add(title_key)
+                merged.append(show)
+                if len(merged) >= limit:
+                    return merged[:limit]
+    
     return merged[:limit]
 
 
 # Initialize clients (will be set in lifespan)
 omdb_client = None
 tmdb_client = None
+tvmaze_client = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global omdb_client, tmdb_client
+    global omdb_client, tmdb_client, tvmaze_client
     omdb_client = OMDBClient(OMDB_API_KEY, OMDB_BASE_URL)
     tmdb_client = TMDBClient(TMDB_ACCESS_TOKEN, TMDB_BASE_URL)
+    tvmaze_client = TVMazeClient(TVMAZE_BASE_URL)
     yield
     # Shutdown
     if omdb_client:
         await omdb_client.close()
     if tmdb_client:
         await tmdb_client.close()
+    if tvmaze_client:
+        await tvmaze_client.close()
 
 
 app = FastAPI(
@@ -498,26 +684,37 @@ async def search_movies(
     year: Optional[int] = Query(None, description="Filter by year"),
     type: Optional[str] = Query(None, description="Type: movie, series, episode, anime")
 ):
-    """Search for movies/TV series/Anime from both OMDB and TMDB"""
+    """Search for movies/TV series/Anime from OMDB, TMDB, and TVMaze"""
     try:
         # Map type for OMDB (series -> series, anime -> series for OMDB)
         omdb_type = type
         if type == "anime":
             omdb_type = "series"  # OMDB doesn't have anime type, use series
         
-        # Search both APIs concurrently
+        # Search all three APIs concurrently
         omdb_task = omdb_client.search_movies(query, page, year, omdb_type)
         tmdb_task = tmdb_client.search_movies(query, page, year, type)
+        # Only search TVMaze for series/anime (not movies)
+        if type != "movie":
+            tvmaze_task = tvmaze_client.search_shows(query, page, year, type)
+            omdb_result, tmdb_result, tvmaze_result = await asyncio.gather(
+                omdb_task,
+                tmdb_task,
+                tvmaze_task,
+                return_exceptions=True
+            )
+        else:
+            omdb_result, tmdb_result = await asyncio.gather(
+                omdb_task,
+                tmdb_task,
+                return_exceptions=True
+            )
+            tvmaze_result = {"Response": "False", "Search": []}
         
-        omdb_result, tmdb_result = await asyncio.gather(
-            omdb_task,
-            tmdb_task,
-            return_exceptions=True
-        )
-        
-        # Extract movies from both results
+        # Extract movies from all results
         omdb_movies = []
         tmdb_movies = []
+        tvmaze_shows = []
         
         if isinstance(omdb_result, dict) and omdb_result.get("Response") == "True":
             omdb_movies = omdb_result.get("Search", [])
@@ -528,8 +725,11 @@ async def search_movies(
         if isinstance(tmdb_result, dict) and tmdb_result.get("Response") == "True":
             tmdb_movies = tmdb_result.get("Search", [])
         
+        if isinstance(tvmaze_result, dict) and tvmaze_result.get("Response") == "True":
+            tvmaze_shows = tvmaze_result.get("Search", [])
+        
         # Merge results (limit to 20 per page)
-        merged_movies = merge_movie_results(omdb_movies, tmdb_movies, limit=20)
+        merged_movies = merge_movie_results(omdb_movies, tmdb_movies, tvmaze_shows, limit=20)
         
         return {
             "Response": "True",
@@ -547,50 +747,60 @@ async def get_popular_movies(
     enrich: bool = Query(False, description="Enrich with full movie details"),
     type: Optional[str] = Query(None, description="Type: movie, series, anime")
 ):
-    """Get popular movies/TV series/Anime from both OMDB and TMDB"""
+    """Get popular movies/TV series/Anime from OMDB, TMDB, and TVMaze"""
     try:
         if type == "series":
             # Get TV series
             omdb_task = omdb_client.search_movies("the", page=1, type="series")
             tmdb_task = tmdb_client.get_popular_tv_shows(limit)
+            tvmaze_task = tvmaze_client.get_popular_shows(limit, content_type="series")
             
-            omdb_result, tmdb_movies = await asyncio.gather(
+            omdb_result, tmdb_movies, tvmaze_shows = await asyncio.gather(
                 omdb_task,
                 tmdb_task,
+                tvmaze_task,
                 return_exceptions=True
             )
             
             omdb_movies = []
             if isinstance(omdb_result, dict) and omdb_result.get("Response") == "True":
-                omdb_movies = omdb_result.get("Search", [])[:limit // 2]
+                omdb_movies = omdb_result.get("Search", [])[:limit // 3]
             
             if isinstance(tmdb_movies, Exception):
                 tmdb_movies = []
             
-            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, limit)
+            if isinstance(tvmaze_shows, Exception):
+                tvmaze_shows = []
+            
+            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, tvmaze_shows, limit)
             
         elif type == "anime":
             # Get anime
             omdb_task = omdb_client.search_movies("anime", page=1, type="series")
             tmdb_task = tmdb_client.get_anime_shows(limit)
+            tvmaze_task = tvmaze_client.get_popular_shows(limit, content_type="anime")
             
-            omdb_result, tmdb_movies = await asyncio.gather(
+            omdb_result, tmdb_movies, tvmaze_shows = await asyncio.gather(
                 omdb_task,
                 tmdb_task,
+                tvmaze_task,
                 return_exceptions=True
             )
             
             omdb_movies = []
             if isinstance(omdb_result, dict) and omdb_result.get("Response") == "True":
-                omdb_movies = omdb_result.get("Search", [])[:limit // 2]
+                omdb_movies = omdb_result.get("Search", [])[:limit // 3]
             
             if isinstance(tmdb_movies, Exception):
                 tmdb_movies = []
             
-            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, limit)
+            if isinstance(tvmaze_shows, Exception):
+                tvmaze_shows = []
+            
+            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, tvmaze_shows, limit)
             
         else:
-            # Get movies (default)
+            # Get movies (default) - TVMaze doesn't have movies, so skip it
             omdb_task = omdb_client.get_popular_movies(limit // 2, enrich=enrich)
             tmdb_task = tmdb_client.get_popular_movies(limit // 2)
             
@@ -606,8 +816,8 @@ async def get_popular_movies(
             if isinstance(tmdb_movies, Exception):
                 tmdb_movies = []
             
-            # Merge results
-            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, limit)
+            # Merge results (no TVMaze for movies)
+            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, None, limit)
         
         return {"Response": "True", "Search": merged_movies, "totalResults": str(len(merged_movies))}
     except Exception as e:
