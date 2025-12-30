@@ -38,6 +38,9 @@ YOUTUBE_BASE_URL = "https://www.googleapis.com/youtube/v3"
 # AniList GraphQL API Configuration (for anime and manga - Free, no API key required)
 ANILIST_BASE_URL = "https://graphql.anilist.co"
 
+# Kitsu API Configuration (for manga - Free, no API key required)
+KITSU_BASE_URL = "https://kitsu.io/api/edge"
+
 # In-memory cache for API responses (in production, use Redis)
 cache = {}
 CACHE_DURATION = timedelta(hours=1)
@@ -1495,6 +1498,133 @@ class AniListClient:
         await self.client.aclose()
 
 
+class KitsuClient:
+    """Client for interacting with Kitsu API for manga (Free, no API key required)"""
+    
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+        self.client = httpx.AsyncClient(
+            timeout=10.0,
+            headers={
+                "accept": "application/vnd.api+json",
+                "content-type": "application/vnd.api+json"
+            }
+        )
+    
+    def _normalize_kitsu_to_omdb_format(self, item: dict) -> dict:
+        """Convert Kitsu manga format to OMDB-like format for consistency"""
+        attributes = item.get("attributes", {})
+        
+        # Get title
+        title = attributes.get("canonicalTitle") or attributes.get("titles", {}).get("en") or attributes.get("titles", {}).get("en_jp", "")
+        
+        # Get poster
+        poster = attributes.get("posterImage", {}).get("large") or attributes.get("posterImage", {}).get("medium", "N/A")
+        
+        # Get year from start date
+        start_date = attributes.get("startDate", "")
+        year = str(start_date)[:4] if start_date else "N/A"
+        
+        # Get description
+        description = attributes.get("synopsis", "").replace("<p>", "").replace("</p>", "").replace("<br>", " ").replace("</br>", "") if attributes.get("synopsis") else ""
+        
+        return {
+            "Title": title,
+            "Year": year,
+            "imdbID": f"kitsu_{item.get('id')}",
+            "Type": "manga",
+            "Poster": poster,
+            "Plot": description,
+            "kitsu_id": item.get("id"),
+            "kitsu_rating": attributes.get("averageRating"),
+            "chapters": attributes.get("chapterCount"),
+            "volumes": attributes.get("volumeCount"),
+            "status": attributes.get("status"),
+            "subtype": attributes.get("subtype"),
+            "genres": [g.get("attributes", {}).get("name") for g in attributes.get("genres", {}).get("data", [])] if attributes.get("genres") else [],
+            "source": "kitsu"
+        }
+    
+    async def search_manga(self, query: str, limit: int = 20, offset: int = 0) -> List[dict]:
+        """Search for manga on Kitsu"""
+        cache_key = f"kitsu_manga_search:{query}:{limit}:{offset}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            url = f"{self.base_url}/manga"
+            params = {
+                "filter[text]": query,
+                "page[limit]": limit,
+                "page[offset]": offset,
+                "sort": "-popularityRank"
+            }
+            
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            manga_list = data.get("data", [])
+            
+            # Normalize results
+            normalized_results = []
+            for item in manga_list:
+                normalized_results.append(self._normalize_kitsu_to_omdb_format(item))
+            
+            # Cache the response
+            cache[cache_key] = (normalized_results, datetime.now())
+            
+            return normalized_results
+        except httpx.HTTPError as e:
+            print(f"Kitsu API error: {str(e)}")
+            return []
+    
+    async def get_popular_manga(self, limit: int = 20, offset: int = 0) -> List[dict]:
+        """Get popular manga from Kitsu"""
+        cache_key = f"kitsu_popular_manga:{limit}:{offset}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            url = f"{self.base_url}/manga"
+            params = {
+                "page[limit]": limit,
+                "page[offset]": offset,
+                "sort": "-popularityRank"
+            }
+            
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            manga_list = data.get("data", [])
+            
+            # Normalize results
+            normalized_results = []
+            for item in manga_list:
+                normalized_results.append(self._normalize_kitsu_to_omdb_format(item))
+            
+            # Cache the response
+            cache[cache_key] = (normalized_results, datetime.now())
+            
+            return normalized_results
+        except httpx.HTTPError as e:
+            print(f"Kitsu API error: {str(e)}")
+            return []
+    
+    async def close(self):
+        """Close the HTTP client"""
+        await self.client.aclose()
+
+
 def merge_movie_results(omdb_movies: List[dict], tmdb_movies: List[dict], tvmaze_shows: List[dict] = None, anilist_items: List[dict] = None, limit: int = 20) -> List[dict]:
     """Merge and deduplicate movie/anime/manga results from all APIs"""
     seen_titles = set()
@@ -1553,13 +1683,14 @@ anilist_client = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global omdb_client, tmdb_client, tvmaze_client, watchmode_client, youtube_client, anilist_client
+    global omdb_client, tmdb_client, tvmaze_client, watchmode_client, youtube_client, anilist_client, kitsu_client
     omdb_client = OMDBClient(OMDB_API_KEY, OMDB_BASE_URL)
     tmdb_client = TMDBClient(TMDB_ACCESS_TOKEN, TMDB_BASE_URL)
     tvmaze_client = TVMazeClient(TVMAZE_BASE_URL)
     watchmode_client = WatchModeClient(WATCHMODE_API_KEY, WATCHMODE_BASE_URL)
     youtube_client = YouTubeClient(YOUTUBE_API_KEY, YOUTUBE_BASE_URL)
     anilist_client = AniListClient(ANILIST_BASE_URL)
+    kitsu_client = KitsuClient(KITSU_BASE_URL)
     yield
     # Shutdown
     if omdb_client:
@@ -1574,6 +1705,8 @@ async def lifespan(app: FastAPI):
         await youtube_client.close()
     if anilist_client:
         await anilist_client.close()
+    if kitsu_client:
+        await kitsu_client.close()
 
 
 app = FastAPI(
@@ -2023,10 +2156,35 @@ async def search_manga(
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=50, description="Results per page")
 ):
-    """Search for manga using AniList API"""
+    """Search for manga using AniList and Kitsu APIs"""
     try:
-        result = await anilist_client.search_manga(query, page, per_page=limit)
-        return result
+        # Fetch from both APIs concurrently
+        offset = (page - 1) * limit
+        anilist_task = anilist_client.search_manga(query, page, per_page=limit // 2)
+        kitsu_task = kitsu_client.search_manga(query, limit // 2, offset)
+        
+        anilist_result, kitsu_manga = await asyncio.gather(
+            anilist_task,
+            kitsu_task,
+            return_exceptions=True
+        )
+        
+        # Extract manga from AniList result
+        anilist_manga = []
+        if isinstance(anilist_result, dict) and anilist_result.get("Response") == "True":
+            anilist_manga = anilist_result.get("Search", [])
+        
+        if isinstance(kitsu_manga, Exception):
+            kitsu_manga = []
+        
+        # Merge results
+        all_manga = anilist_manga + kitsu_manga
+        
+        return {
+            "Response": "True",
+            "Search": all_manga[:limit],
+            "totalResults": str(len(all_manga))
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2035,13 +2193,31 @@ async def search_manga(
 async def get_popular_manga(
     limit: int = Query(50, ge=1, le=100, description="Number of results")
 ):
-    """Get popular manga from AniList"""
+    """Get popular manga from AniList and Kitsu"""
     try:
-        manga_list = await anilist_client.get_popular_manga(limit)
+        # Fetch from both APIs concurrently
+        anilist_task = anilist_client.get_popular_manga(limit // 2)
+        kitsu_task = kitsu_client.get_popular_manga(limit // 2)
+        
+        anilist_manga, kitsu_manga = await asyncio.gather(
+            anilist_task,
+            kitsu_task,
+            return_exceptions=True
+        )
+        
+        if isinstance(anilist_manga, Exception):
+            anilist_manga = []
+        
+        if isinstance(kitsu_manga, Exception):
+            kitsu_manga = []
+        
+        # Merge results
+        all_manga = anilist_manga + kitsu_manga
+        
         return {
             "Response": "True",
-            "Search": manga_list,
-            "totalResults": str(len(manga_list))
+            "Search": all_manga[:limit],
+            "totalResults": str(len(all_manga))
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
