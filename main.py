@@ -1,7 +1,7 @@
 """
 EVC - E-Video Cloud Backend API
-FastAPI backend for movie data retrieval from OMDB, TMDB, TVMaze, WatchMode, and YouTube APIs
-Combines results from all five APIs for maximum movie coverage with trailers, streaming links, and music videos
+FastAPI backend for movie data retrieval from OMDB, TMDB, TVMaze, WatchMode, YouTube, and AniList APIs
+Combines results from all six APIs for maximum movie/anime/manga coverage with trailers, streaming links, and music videos
 """
 
 from fastapi import FastAPI, HTTPException, Query
@@ -34,6 +34,9 @@ WATCHMODE_BASE_URL = "https://api.watchmode.com/v1"
 # YouTube Data API Configuration (for music videos and trailers)
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "AIzaSyCvjc895h-fmSW3ZMn-jy3wWtHk4wH3fx8")
 YOUTUBE_BASE_URL = "https://www.googleapis.com/youtube/v3"
+
+# AniList GraphQL API Configuration (for anime and manga - Free, no API key required)
+ANILIST_BASE_URL = "https://graphql.anilist.co"
 
 # In-memory cache for API responses (in production, use Redis)
 cache = {}
@@ -877,8 +880,544 @@ class YouTubeClient:
         await self.client.aclose()
 
 
-def merge_movie_results(omdb_movies: List[dict], tmdb_movies: List[dict], tvmaze_shows: List[dict] = None, limit: int = 20) -> List[dict]:
-    """Merge and deduplicate movie results from all three APIs"""
+class AniListClient:
+    """Client for interacting with AniList GraphQL API for anime and manga"""
+    
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+        self.client = httpx.AsyncClient(
+            timeout=10.0,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+        )
+    
+    async def _execute_query(self, query: str, variables: dict = None) -> dict:
+        """Execute a GraphQL query"""
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+        
+        try:
+            response = await self.client.post(self.base_url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            
+            if "errors" in data:
+                print(f"AniList GraphQL errors: {data['errors']}")
+                return {}
+            
+            return data.get("data", {})
+        except httpx.HTTPError as e:
+            print(f"AniList API error: {str(e)}")
+            return {}
+    
+    def _normalize_anilist_to_omdb_format(self, item: dict, item_type: str = "anime") -> dict:
+        """Convert AniList format to OMDB-like format for consistency"""
+        title = item.get("title", {})
+        title_english = title.get("english") or title.get("romaji") or ""
+        
+        # Get cover image
+        cover_image = item.get("coverImage", {})
+        poster = cover_image.get("large") or cover_image.get("medium", "N/A")
+        
+        # Get year from start date
+        start_date = item.get("startDate", {})
+        year = str(start_date.get("year", "N/A")) if start_date.get("year") else "N/A"
+        
+        # Get trailer YouTube ID
+        trailer = None
+        trailer_data = item.get("trailer", {})
+        if trailer_data and trailer_data.get("id"):
+            trailer = f"https://www.youtube.com/watch?v={trailer_data['id']}"
+        
+        # Get studios
+        studios = []
+        for studio in item.get("studios", {}).get("nodes", []):
+            studios.append(studio.get("name", ""))
+        
+        # Get characters (main characters)
+        characters = []
+        for char in item.get("characters", {}).get("nodes", [])[:10]:  # Top 10 characters
+            characters.append({
+                "name": char.get("name", {}).get("full", ""),
+                "image": char.get("image", {}).get("large", ""),
+                "role": char.get("role", "")
+            })
+        
+        return {
+            "Title": title_english,
+            "Year": year,
+            "imdbID": f"anilist_{item.get('id')}",
+            "Type": item_type,
+            "Poster": poster,
+            "anilist_id": item.get("id"),
+            "anilist_rating": item.get("averageScore"),
+            "anilist_popularity": item.get("popularity"),
+            "anilist_format": item.get("format"),  # TV, MOVIE, OVA, etc.
+            "anilist_status": item.get("status"),  # FINISHED, RELEASING, etc.
+            "anilist_episodes": item.get("episodes"),  # For anime
+            "anilist_chapters": item.get("chapters"),  # For manga
+            "anilist_volumes": item.get("volumes"),  # For manga
+            "anilist_season": item.get("season"),  # WINTER, SPRING, SUMMER, FALL
+            "anilist_seasonYear": item.get("seasonYear"),
+            "overview": item.get("description", "").replace("<br>", "\n").replace("<i>", "").replace("</i>", ""),
+            "genres": item.get("genres", []),
+            "studios": studios,
+            "characters": characters,
+            "trailer": trailer,
+            "trailer_youtube_id": trailer_data.get("id") if trailer_data else None,
+            "source": "anilist"
+        }
+    
+    async def search_anime(self, query: str, page: int = 1, per_page: int = 20) -> dict:
+        """Search for anime"""
+        cache_key = f"anilist_anime_search:{query}:{page}:{per_page}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        graphql_query = """
+        query ($search: String, $page: Int, $perPage: Int) {
+            Page(page: $page, perPage: $perPage) {
+                pageInfo {
+                    total
+                    currentPage
+                    lastPage
+                    hasNextPage
+                }
+                media(search: $search, type: ANIME, sort: POPULARITY_DESC) {
+                    id
+                    title {
+                        romaji
+                        english
+                    }
+                    description
+                    coverImage {
+                        large
+                        medium
+                    }
+                    startDate {
+                        year
+                        month
+                        day
+                    }
+                    averageScore
+                    popularity
+                    format
+                    status
+                    episodes
+                    season
+                    seasonYear
+                    genres
+                    studios {
+                        nodes {
+                            name
+                        }
+                    }
+                    characters {
+                        nodes {
+                            name {
+                                full
+                            }
+                            image {
+                                large
+                            }
+                            role
+                        }
+                    }
+                    trailer {
+                        id
+                        site
+                    }
+                }
+            }
+        }
+        """
+        
+        variables = {
+            "search": query,
+            "page": page,
+            "perPage": per_page
+        }
+        
+        data = await self._execute_query(graphql_query, variables)
+        
+        if not data:
+            return {"Response": "False", "Search": [], "totalResults": "0"}
+        
+        page_data = data.get("Page", {})
+        media_list = page_data.get("media", [])
+        page_info = page_data.get("pageInfo", {})
+        
+        # Normalize results
+        normalized_results = []
+        for item in media_list:
+            normalized_results.append(self._normalize_anilist_to_omdb_format(item, "anime"))
+        
+        result = {
+            "Response": "True",
+            "Search": normalized_results,
+            "totalResults": str(page_info.get("total", len(normalized_results)))
+        }
+        
+        # Cache the response
+        cache[cache_key] = (result, datetime.now())
+        
+        return result
+    
+    async def search_manga(self, query: str, page: int = 1, per_page: int = 20) -> dict:
+        """Search for manga"""
+        cache_key = f"anilist_manga_search:{query}:{page}:{per_page}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        graphql_query = """
+        query ($search: String, $page: Int, $perPage: Int) {
+            Page(page: $page, perPage: $perPage) {
+                pageInfo {
+                    total
+                    currentPage
+                    lastPage
+                    hasNextPage
+                }
+                media(search: $search, type: MANGA, sort: POPULARITY_DESC) {
+                    id
+                    title {
+                        romaji
+                        english
+                    }
+                    description
+                    coverImage {
+                        large
+                        medium
+                    }
+                    startDate {
+                        year
+                        month
+                        day
+                    }
+                    averageScore
+                    popularity
+                    format
+                    status
+                    chapters
+                    volumes
+                    genres
+                    studios {
+                        nodes {
+                            name
+                        }
+                    }
+                    characters {
+                        nodes {
+                            name {
+                                full
+                            }
+                            image {
+                                large
+                            }
+                            role
+                        }
+                    }
+                }
+            }
+        }
+        """
+        
+        variables = {
+            "search": query,
+            "page": page,
+            "perPage": per_page
+        }
+        
+        data = await self._execute_query(graphql_query, variables)
+        
+        if not data:
+            return {"Response": "False", "Search": [], "totalResults": "0"}
+        
+        page_data = data.get("Page", {})
+        media_list = page_data.get("media", [])
+        page_info = page_data.get("pageInfo", {})
+        
+        # Normalize results
+        normalized_results = []
+        for item in media_list:
+            normalized_results.append(self._normalize_anilist_to_omdb_format(item, "manga"))
+        
+        result = {
+            "Response": "True",
+            "Search": normalized_results,
+            "totalResults": str(page_info.get("total", len(normalized_results)))
+        }
+        
+        # Cache the response
+        cache[cache_key] = (result, datetime.now())
+        
+        return result
+    
+    async def get_popular_anime(self, limit: int = 20, page: int = 1) -> List[dict]:
+        """Get popular anime"""
+        cache_key = f"anilist_popular_anime:{page}:{limit}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data.get("results", [])[:limit]
+        
+        graphql_query = """
+        query ($page: Int, $perPage: Int) {
+            Page(page: $page, perPage: $perPage) {
+                media(type: ANIME, sort: POPULARITY_DESC, status: RELEASING) {
+                    id
+                    title {
+                        romaji
+                        english
+                    }
+                    description
+                    coverImage {
+                        large
+                        medium
+                    }
+                    startDate {
+                        year
+                    }
+                    averageScore
+                    popularity
+                    format
+                    status
+                    episodes
+                    season
+                    seasonYear
+                    genres
+                    studios {
+                        nodes {
+                            name
+                        }
+                    }
+                    characters {
+                        nodes {
+                            name {
+                                full
+                            }
+                            image {
+                                large
+                            }
+                            role
+                        }
+                    }
+                    trailer {
+                        id
+                        site
+                    }
+                }
+            }
+        }
+        """
+        
+        variables = {
+            "page": page,
+            "perPage": limit
+        }
+        
+        data = await self._execute_query(graphql_query, variables)
+        
+        if not data:
+            return []
+        
+        media_list = data.get("Page", {}).get("media", [])
+        
+        # Normalize results
+        normalized_results = []
+        for item in media_list:
+            normalized_results.append(self._normalize_anilist_to_omdb_format(item, "anime"))
+        
+        # Cache the response
+        cache[cache_key] = ({"results": normalized_results}, datetime.now())
+        
+        return normalized_results[:limit]
+    
+    async def get_popular_manga(self, limit: int = 20, page: int = 1) -> List[dict]:
+        """Get popular manga"""
+        cache_key = f"anilist_popular_manga:{page}:{limit}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data.get("results", [])[:limit]
+        
+        graphql_query = """
+        query ($page: Int, $perPage: Int) {
+            Page(page: $page, perPage: $perPage) {
+                media(type: MANGA, sort: POPULARITY_DESC, status: RELEASING) {
+                    id
+                    title {
+                        romaji
+                        english
+                    }
+                    description
+                    coverImage {
+                        large
+                        medium
+                    }
+                    startDate {
+                        year
+                    }
+                    averageScore
+                    popularity
+                    format
+                    status
+                    chapters
+                    volumes
+                    genres
+                    studios {
+                        nodes {
+                            name
+                        }
+                    }
+                    characters {
+                        nodes {
+                            name {
+                                full
+                            }
+                            image {
+                                large
+                            }
+                            role
+                        }
+                    }
+                }
+            }
+        }
+        """
+        
+        variables = {
+            "page": page,
+            "perPage": limit
+        }
+        
+        data = await self._execute_query(graphql_query, variables)
+        
+        if not data:
+            return []
+        
+        media_list = data.get("Page", {}).get("media", [])
+        
+        # Normalize results
+        normalized_results = []
+        for item in media_list:
+            normalized_results.append(self._normalize_anilist_to_omdb_format(item, "manga"))
+        
+        # Cache the response
+        cache[cache_key] = ({"results": normalized_results}, datetime.now())
+        
+        return normalized_results[:limit]
+    
+    async def get_anime_by_id(self, anilist_id: int) -> Optional[dict]:
+        """Get detailed anime information by AniList ID"""
+        cache_key = f"anilist_anime:{anilist_id}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        graphql_query = """
+        query ($id: Int) {
+            Media(id: $id, type: ANIME) {
+                id
+                title {
+                    romaji
+                    english
+                }
+                description
+                coverImage {
+                    large
+                    medium
+                }
+                bannerImage
+                startDate {
+                    year
+                    month
+                    day
+                }
+                endDate {
+                    year
+                    month
+                    day
+                }
+                averageScore
+                popularity
+                format
+                status
+                episodes
+                duration
+                season
+                seasonYear
+                genres
+                studios {
+                    nodes {
+                        name
+                        siteUrl
+                    }
+                }
+                characters {
+                    nodes {
+                        name {
+                            full
+                        }
+                        image {
+                            large
+                        }
+                        role
+                    }
+                }
+                trailer {
+                    id
+                    site
+                }
+                siteUrl
+            }
+        }
+        """
+        
+        variables = {"id": anilist_id}
+        
+        data = await self._execute_query(graphql_query, variables)
+        
+        if not data or not data.get("Media"):
+            return None
+        
+        media = data.get("Media")
+        result = self._normalize_anilist_to_omdb_format(media, "anime")
+        result["bannerImage"] = media.get("bannerImage")
+        result["siteUrl"] = media.get("siteUrl")
+        result["duration"] = media.get("duration")
+        result["endDate"] = media.get("endDate", {})
+        
+        # Cache the response
+        cache[cache_key] = (result, datetime.now())
+        
+        return result
+    
+    async def close(self):
+        """Close the HTTP client"""
+        await self.client.aclose()
+
+
+def merge_movie_results(omdb_movies: List[dict], tmdb_movies: List[dict], tvmaze_shows: List[dict] = None, anilist_items: List[dict] = None, limit: int = 20) -> List[dict]:
+    """Merge and deduplicate movie/anime/manga results from all APIs"""
     seen_titles = set()
     merged = []
     
@@ -910,6 +1449,16 @@ def merge_movie_results(omdb_movies: List[dict], tmdb_movies: List[dict], tvmaze
                 if len(merged) >= limit:
                     return merged[:limit]
     
+    # Add AniList items that aren't duplicates (if provided)
+    if anilist_items:
+        for item in anilist_items:
+            title_key = item.get("Title", "").lower().strip()
+            if title_key and title_key not in seen_titles:
+                seen_titles.add(title_key)
+                merged.append(item)
+                if len(merged) >= limit:
+                    return merged[:limit]
+    
     return merged[:limit]
 
 
@@ -919,17 +1468,19 @@ tmdb_client = None
 tvmaze_client = None
 watchmode_client = None
 youtube_client = None
+anilist_client = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global omdb_client, tmdb_client, tvmaze_client, watchmode_client, youtube_client
+    global omdb_client, tmdb_client, tvmaze_client, watchmode_client, youtube_client, anilist_client
     omdb_client = OMDBClient(OMDB_API_KEY, OMDB_BASE_URL)
     tmdb_client = TMDBClient(TMDB_ACCESS_TOKEN, TMDB_BASE_URL)
     tvmaze_client = TVMazeClient(TVMAZE_BASE_URL)
     watchmode_client = WatchModeClient(WATCHMODE_API_KEY, WATCHMODE_BASE_URL)
     youtube_client = YouTubeClient(YOUTUBE_API_KEY, YOUTUBE_BASE_URL)
+    anilist_client = AniListClient(ANILIST_BASE_URL)
     yield
     # Shutdown
     if omdb_client:
@@ -942,6 +1493,8 @@ async def lifespan(app: FastAPI):
         await watchmode_client.close()
     if youtube_client:
         await youtube_client.close()
+    if anilist_client:
+        await anilist_client.close()
 
 
 app = FastAPI(
@@ -987,11 +1540,24 @@ async def search_movies(
         if type == "anime":
             omdb_type = "series"  # OMDB doesn't have anime type, use series
         
-        # Search all three APIs concurrently
+        # Search all APIs concurrently
         omdb_task = omdb_client.search_movies(query, page, year, omdb_type)
         tmdb_task = tmdb_client.search_movies(query, page, year, type)
-        # Only search TVMaze for series/anime (not movies)
-        if type != "movie":
+        
+        # Search AniList for anime
+        anilist_result = {"Response": "False", "Search": []}
+        if type == "anime":
+            anilist_task = anilist_client.search_anime(query, page, per_page=10)
+            # Only search TVMaze for series/anime (not movies)
+            tvmaze_task = tvmaze_client.search_shows(query, page, year, type)
+            omdb_result, tmdb_result, tvmaze_result, anilist_result = await asyncio.gather(
+                omdb_task,
+                tmdb_task,
+                tvmaze_task,
+                anilist_task,
+                return_exceptions=True
+            )
+        elif type != "movie":
             tvmaze_task = tvmaze_client.search_shows(query, page, year, type)
             omdb_result, tmdb_result, tvmaze_result = await asyncio.gather(
                 omdb_task,
@@ -1011,6 +1577,7 @@ async def search_movies(
         omdb_movies = []
         tmdb_movies = []
         tvmaze_shows = []
+        anilist_items = []
         
         if isinstance(omdb_result, dict) and omdb_result.get("Response") == "True":
             omdb_movies = omdb_result.get("Search", [])
@@ -1024,8 +1591,11 @@ async def search_movies(
         if isinstance(tvmaze_result, dict) and tvmaze_result.get("Response") == "True":
             tvmaze_shows = tvmaze_result.get("Search", [])
         
+        if isinstance(anilist_result, dict) and anilist_result.get("Response") == "True":
+            anilist_items = anilist_result.get("Search", [])
+        
         # Merge results (limit to 20 per page)
-        merged_movies = merge_movie_results(omdb_movies, tmdb_movies, tvmaze_shows, limit=20)
+        merged_movies = merge_movie_results(omdb_movies, tmdb_movies, tvmaze_shows, anilist_items, limit=20)
         
         return {
             "Response": "True",
@@ -1068,15 +1638,17 @@ async def get_popular_movies(
             if isinstance(tvmaze_shows, Exception):
                 tvmaze_shows = []
             
-            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, tvmaze_shows, limit)
+            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, tvmaze_shows, None, limit)
             
         elif type == "anime":
-            # Get anime
+            # Get anime - prioritize AniList for anime
+            anilist_task = anilist_client.get_popular_anime(limit)
             omdb_task = omdb_client.search_movies("anime", page=1, type="series")
             tmdb_task = tmdb_client.get_anime_shows(limit)
             tvmaze_task = tvmaze_client.get_popular_shows(limit, content_type="anime")
             
-            omdb_result, tmdb_movies, tvmaze_shows = await asyncio.gather(
+            anilist_items, omdb_result, tmdb_movies, tvmaze_shows = await asyncio.gather(
+                anilist_task,
                 omdb_task,
                 tmdb_task,
                 tvmaze_task,
@@ -1085,7 +1657,7 @@ async def get_popular_movies(
             
             omdb_movies = []
             if isinstance(omdb_result, dict) and omdb_result.get("Response") == "True":
-                omdb_movies = omdb_result.get("Search", [])[:limit // 3]
+                omdb_movies = omdb_result.get("Search", [])[:limit // 4]
             
             if isinstance(tmdb_movies, Exception):
                 tmdb_movies = []
@@ -1093,7 +1665,13 @@ async def get_popular_movies(
             if isinstance(tvmaze_shows, Exception):
                 tvmaze_shows = []
             
-            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, tvmaze_shows, limit)
+            if isinstance(anilist_items, Exception):
+                anilist_items = []
+            
+            # Convert anilist_items list to format for merge
+            anilist_list = anilist_items if isinstance(anilist_items, list) else []
+            
+            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, tvmaze_shows, anilist_list, limit)
             
         else:
             # Get movies (default) - TVMaze doesn't have movies, so skip it
@@ -1112,8 +1690,8 @@ async def get_popular_movies(
             if isinstance(tmdb_movies, Exception):
                 tmdb_movies = []
             
-            # Merge results (no TVMaze for movies)
-            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, None, limit)
+            # Merge results (no TVMaze or AniList for movies)
+            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, None, None, limit)
         
         return {"Response": "True", "Search": merged_movies, "totalResults": str(len(merged_movies))}
     except Exception as e:
@@ -1125,7 +1703,7 @@ async def get_new_releases(
     limit: int = Query(6, ge=1, le=20),
     type: Optional[str] = Query(None, description="Type: movie, series, anime")
 ):
-    """Get new releases from both OMDB and TMDB"""
+    """Get new releases from OMDB, TMDB, and TVMaze"""
     try:
         if type == "series":
             # For TV series, get popular TV shows as "new releases"
@@ -1145,14 +1723,16 @@ async def get_new_releases(
             if isinstance(tmdb_movies, Exception):
                 tmdb_movies = []
             
-            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, limit)
+            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, None, None, limit)
             
         elif type == "anime":
-            # For anime, get anime shows
+            # For anime, get anime shows - prioritize AniList
+            anilist_task = anilist_client.get_popular_anime(limit)
             tmdb_task = tmdb_client.get_anime_shows(limit)
             omdb_task = omdb_client.search_movies("anime", page=1, type="series")
             
-            tmdb_movies, omdb_result = await asyncio.gather(
+            anilist_items, tmdb_movies, omdb_result = await asyncio.gather(
+                anilist_task,
                 tmdb_task,
                 omdb_task,
                 return_exceptions=True
@@ -1160,12 +1740,16 @@ async def get_new_releases(
             
             omdb_movies = []
             if isinstance(omdb_result, dict) and omdb_result.get("Response") == "True":
-                omdb_movies = omdb_result.get("Search", [])[:limit // 2]
+                omdb_movies = omdb_result.get("Search", [])[:limit // 3]
             
             if isinstance(tmdb_movies, Exception):
                 tmdb_movies = []
             
-            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, limit)
+            if isinstance(anilist_items, Exception):
+                anilist_items = []
+            
+            anilist_list = anilist_items if isinstance(anilist_items, list) else []
+            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, None, anilist_list, limit)
             
         else:
             # For movies (default), fetch from TMDB's "now playing" endpoint
@@ -1178,11 +1762,18 @@ async def get_new_releases(
                 omdb_client.search_movies("action", page=1, year=current_year - 1)
             ]
             
-            tmdb_movies, *omdb_results = await asyncio.gather(
-                tmdb_task,
-                *omdb_tasks,
-                return_exceptions=True
-            )
+            try:
+                results = await asyncio.gather(
+                    tmdb_task,
+                    *omdb_tasks,
+                    return_exceptions=True
+                )
+                tmdb_movies = results[0]
+                omdb_results = results[1:]
+            except Exception as e:
+                print(f"Error gathering results: {str(e)}")
+                tmdb_movies = []
+                omdb_results = []
             
             # Handle exceptions
             if isinstance(tmdb_movies, Exception):
@@ -1195,14 +1786,23 @@ async def get_new_releases(
                     omdb_movies.extend(result.get("Search", []))
             
             # Merge results
-            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, limit)
+            merged_movies = merge_movie_results(omdb_movies, tmdb_movies, None, None, limit)
             
-            # Enrich with full details from OMDB if available
-            merged_movies = await omdb_client.enrich_movie_details(merged_movies)
+            # Enrich with full details from OMDB if available (but don't fail if it errors)
+            try:
+                if merged_movies:
+                    merged_movies = await omdb_client.enrich_movie_details(merged_movies)
+            except Exception as e:
+                print(f"Error enriching movie details: {str(e)}")
+                # Continue with unenriched movies
         
         return {"Response": "True", "Search": merged_movies, "totalResults": str(len(merged_movies))}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        error_detail = f"Error in get_new_releases: {str(e)}\n{traceback.format_exc()}"
+        print(error_detail)
+        # Return empty result instead of raising 500 error
+        return {"Response": "True", "Search": [], "totalResults": "0"}
 
 
 @app.get("/api/movies/{imdb_id}")
@@ -1331,6 +1931,50 @@ async def get_movie_youtube(imdb_id: str, include_music: bool = Query(True, desc
         if isinstance(music_videos, list):
             result["youtube_music_videos"] = music_videos
         
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/manga/search")
+async def search_manga(
+    query: str = Query(..., description="Search query for manga"),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=50, description="Results per page")
+):
+    """Search for manga using AniList API"""
+    try:
+        result = await anilist_client.search_manga(query, page, per_page=limit)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/manga/popular")
+async def get_popular_manga(
+    limit: int = Query(20, ge=1, le=100, description="Number of results")
+):
+    """Get popular manga from AniList"""
+    try:
+        manga_list = await anilist_client.get_popular_manga(limit)
+        return {
+            "Response": "True",
+            "Search": manga_list,
+            "totalResults": str(len(manga_list))
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/anime/{anilist_id}")
+async def get_anime_by_id(anilist_id: int):
+    """Get detailed anime information by AniList ID"""
+    try:
+        result = await anilist_client.get_anime_by_id(anilist_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Anime not found")
         return result
     except HTTPException:
         raise
