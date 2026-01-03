@@ -818,7 +818,16 @@ class WatchModeClient:
         
         # Add WatchMode data to movie
         if isinstance(details, dict):
-            movie["trailer"] = details.get("trailer")
+            trailer_url = details.get("trailer")
+            # Convert trailer URL to embed format if it's a YouTube URL
+            if trailer_url and "youtube.com" in trailer_url:
+                # Extract video ID and convert to embed URL
+                import re
+                video_match = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([^&\s]+)', trailer_url)
+                if video_match:
+                    video_id = video_match.group(1).split('&')[0].split('?')[0]
+                    trailer_url = f"https://www.youtube.com/embed/{video_id}"
+            movie["trailer"] = trailer_url
             movie["watchmode_id"] = title_id
             movie["watchmode_imdb_id"] = details.get("imdb_id")
             movie["watchmode_tmdb_id"] = details.get("tmdb_id")
@@ -860,6 +869,32 @@ class YouTubeClient:
                 "accept": "application/json"
             }
         )
+    
+    def _convert_to_embed_url(self, url: str) -> Optional[str]:
+        """Convert any YouTube URL to embed format"""
+        if not url:
+            return None
+        
+        # If already embed URL, return as is
+        if "youtube.com/embed/" in url:
+            return url
+        
+        # Extract video ID from various formats
+        import re
+        
+        # Format: https://www.youtube.com/watch?v=VIDEO_ID
+        watch_match = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([^&\s]+)', url)
+        if watch_match:
+            video_id = watch_match.group(1).split('&')[0].split('?')[0]
+            return f"https://www.youtube.com/embed/{video_id}"
+        
+        # Format: https://www.youtube.com/embed/VIDEO_ID
+        embed_match = re.search(r'youtube\.com/embed/([^&\s]+)', url)
+        if embed_match:
+            video_id = embed_match.group(1).split('&')[0].split('?')[0]
+            return f"https://www.youtube.com/embed/{video_id}"
+        
+        return None
     
     async def search_videos(
         self, 
@@ -954,12 +989,20 @@ class YouTubeClient:
         
         # Add YouTube data to movie
         if isinstance(trailers, list) and trailers:
+            # Ensure all trailers have embed_url
+            for trailer in trailers:
+                if not trailer.get("embed_url") and trailer.get("url"):
+                    trailer["embed_url"] = self._convert_to_embed_url(trailer.get("url"))
             movie["youtube_trailers"] = trailers
             # Set primary trailer URL if not already set from WatchMode
             if not movie.get("trailer") and trailers:
                 movie["trailer"] = trailers[0].get("url")
         
         if isinstance(music_videos, list) and music_videos:
+            # Ensure all music videos have embed_url
+            for music in music_videos:
+                if not music.get("embed_url") and music.get("url"):
+                    music["embed_url"] = self._convert_to_embed_url(music.get("url"))
             movie["youtube_music_videos"] = music_videos
         
         return movie
@@ -2022,11 +2065,11 @@ async def search_movies(
                 return_exceptions=True
             )
         else:
-            omdb_result, tmdb_result = await asyncio.gather(
-                omdb_task,
-                tmdb_task,
-                return_exceptions=True
-            )
+        omdb_result, tmdb_result = await asyncio.gather(
+            omdb_task,
+            tmdb_task,
+            return_exceptions=True
+        )
             tvmaze_result = {"Response": "False", "Search": []}
         
         # Extract movies from all results
@@ -2220,10 +2263,10 @@ async def get_new_releases(
             
             try:
                 results = await asyncio.gather(
-                    tmdb_task,
-                    *omdb_tasks,
-                    return_exceptions=True
-                )
+                tmdb_task,
+                *omdb_tasks,
+                return_exceptions=True
+            )
                 tmdb_movies = results[0]
                 omdb_results = results[1:]
             except Exception as e:
@@ -2247,7 +2290,7 @@ async def get_new_releases(
             # Enrich with full details from OMDB if available (but don't fail if it errors)
             try:
                 if merged_movies:
-                    merged_movies = await omdb_client.enrich_movie_details(merged_movies)
+            merged_movies = await omdb_client.enrich_movie_details(merged_movies)
             except Exception as e:
                 print(f"Error enriching movie details: {str(e)}")
                 # Continue with unenriched movies
