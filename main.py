@@ -1341,7 +1341,7 @@ class AniListClient:
         graphql_query = """
         query ($page: Int, $perPage: Int) {
             Page(page: $page, perPage: $perPage) {
-                media(type: MANGA, sort: POPULARITY_DESC, status: RELEASING) {
+                media(type: MANGA, sort: POPULARITY_DESC) {
                     id
                     title {
                         romaji
@@ -2199,20 +2199,35 @@ async def get_popular_manga(
         anilist_task = anilist_client.get_popular_manga(limit // 2)
         kitsu_task = kitsu_client.get_popular_manga(limit // 2)
         
-        anilist_manga, kitsu_manga = await asyncio.gather(
+        anilist_result, kitsu_manga = await asyncio.gather(
             anilist_task,
             kitsu_task,
             return_exceptions=True
         )
         
-        if isinstance(anilist_manga, Exception):
+        # Extract manga from AniList result (it returns a list directly)
+        anilist_manga = []
+        if isinstance(anilist_result, list):
+            anilist_manga = anilist_result
+        elif isinstance(anilist_result, Exception):
+            print(f"AniList error: {anilist_result}")
+            anilist_manga = []
+        else:
+            # Unexpected type
+            print(f"AniList returned unexpected type: {type(anilist_result)}")
             anilist_manga = []
         
         if isinstance(kitsu_manga, Exception):
+            print(f"Kitsu error: {kitsu_manga}")
+            kitsu_manga = []
+        elif not isinstance(kitsu_manga, list):
+            print(f"Kitsu returned unexpected type: {type(kitsu_manga)}")
             kitsu_manga = []
         
         # Merge results
         all_manga = anilist_manga + kitsu_manga
+        
+        print(f"Manga popular: AniList={len(anilist_manga)}, Kitsu={len(kitsu_manga)}, Total={len(all_manga)}")
         
         return {
             "Response": "True",
@@ -2220,6 +2235,9 @@ async def get_popular_manga(
             "totalResults": str(len(all_manga))
         }
     except Exception as e:
+        print(f"Error in get_popular_manga: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
