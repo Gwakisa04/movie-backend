@@ -44,6 +44,10 @@ KITSU_BASE_URL = "https://kitsu.io/api/edge"
 # Project Gutenberg (Gutendex) API Configuration (for books - Free, no API key required)
 GUTENDEX_BASE_URL = "https://gutendex.com"
 
+# JustWatch API Configuration (for direct watch links and streaming availability)
+JUSTWATCH_BASE_URL = "https://apis.justwatch.com"
+JUSTWATCH_COUNTRY = "US"  # Default country, can be made configurable
+
 # In-memory cache for API responses (in production, use Redis)
 cache = {}
 CACHE_DURATION = timedelta(hours=1)
@@ -1794,6 +1798,49 @@ class GutenbergClient:
         await self.client.aclose()
 
 
+class JustWatchClient:
+    """Client for interacting with JustWatch API for direct watch links and streaming availability"""
+    
+    def __init__(self, base_url: str, country: str = "US"):
+        self.base_url = base_url
+        self.country = country
+        self.client = httpx.AsyncClient(
+            timeout=10.0,
+            headers={
+                "accept": "application/json",
+                "Content-Type": "application/json"
+            }
+        )
+    
+    async def get_watch_options(self, title: str, imdb_id: Optional[str] = None, country: Optional[str] = None) -> dict:
+        """
+        Get watch options for a title
+        Returns: {
+            "can_watch_directly": bool,
+            "direct_watch_url": str or None,
+            "platform": str or None,
+            "fallback_to_watchmode": bool
+        }
+        Note: JustWatch doesn't have a public API, so we use WatchMode as primary source
+        This can be extended when JustWatch API becomes available
+        """
+        country = country or self.country
+        
+        # For now, JustWatch doesn't have a public API
+        # We'll enhance WatchMode results to provide better watch options
+        return {
+            "can_watch_directly": False,
+            "direct_watch_url": None,
+            "platform": None,
+            "fallback_to_watchmode": True,
+            "note": "Using WatchMode for streaming availability"
+        }
+    
+    async def close(self):
+        """Close the HTTP client"""
+        await self.client.aclose()
+
+
 def merge_movie_results(omdb_movies: List[dict], tmdb_movies: List[dict], tvmaze_shows: List[dict] = None, anilist_items: List[dict] = None, limit: int = 20) -> List[dict]:
     """Merge and deduplicate movie/anime/manga results from all APIs"""
     seen_titles = set()
@@ -1849,12 +1896,13 @@ youtube_client = None
 anilist_client = None
 kitsu_client = None
 gutenberg_client = None
+justwatch_client = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global omdb_client, tmdb_client, tvmaze_client, watchmode_client, youtube_client, anilist_client, kitsu_client, gutenberg_client
+    global omdb_client, tmdb_client, tvmaze_client, watchmode_client, youtube_client, anilist_client, kitsu_client, gutenberg_client, justwatch_client
     omdb_client = OMDBClient(OMDB_API_KEY, OMDB_BASE_URL)
     tmdb_client = TMDBClient(TMDB_ACCESS_TOKEN, TMDB_BASE_URL)
     tvmaze_client = TVMazeClient(TVMAZE_BASE_URL)
@@ -1863,6 +1911,7 @@ async def lifespan(app: FastAPI):
     anilist_client = AniListClient(ANILIST_BASE_URL)
     kitsu_client = KitsuClient(KITSU_BASE_URL)
     gutenberg_client = GutenbergClient(GUTENDEX_BASE_URL)
+    justwatch_client = JustWatchClient(JUSTWATCH_BASE_URL, JUSTWATCH_COUNTRY)
     yield
     # Shutdown
     if omdb_client:
@@ -1881,6 +1930,8 @@ async def lifespan(app: FastAPI):
         await kitsu_client.close()
     if gutenberg_client:
         await gutenberg_client.close()
+    if justwatch_client:
+        await justwatch_client.close()
 
 
 app = FastAPI(
@@ -2270,6 +2321,106 @@ async def get_movie_streaming(imdb_id: str):
             result["streaming_sources"] = sources
         
         return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/movies/{imdb_id}/watch")
+async def get_movie_watch_options(imdb_id: str, country: str = Query("US", description="Country code for streaming availability")):
+    """
+    Get comprehensive watch options for a movie
+    Checks JustWatch first (if available), then falls back to WatchMode
+    Returns: can_watch_directly, direct_watch_url, streaming_sources, platforms
+    """
+    try:
+        # Get movie details first
+        movie = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=True)
+        if movie is None:
+            raise HTTPException(status_code=404, detail="Movie not found")
+        
+        title = movie.get("Title", "")
+        
+        # Check JustWatch for direct watch (currently returns fallback)
+        justwatch_options = await justwatch_client.get_watch_options(title, imdb_id, country)
+        
+        # Get WatchMode streaming sources
+        watchmode_sources = []
+        trailer = None
+        
+        try:
+            watchmode_results = await watchmode_client.search_titles(title)
+            if watchmode_results:
+                title_id = watchmode_results[0].get("id")
+                if title_id:
+                    details_task = watchmode_client.get_title_details(title_id)
+                    sources_task = watchmode_client.get_title_sources(title_id)
+                    
+                    details, sources = await asyncio.gather(
+                        details_task,
+                        sources_task,
+                        return_exceptions=True
+                    )
+                    
+                    if isinstance(details, dict):
+                        trailer = details.get("trailer")
+                    
+                    if isinstance(sources, list):
+                        watchmode_sources = sources
+        except Exception as e:
+            print(f"WatchMode error: {str(e)}")
+        
+        # Format streaming sources
+        formatted_sources = []
+        platform_names = set()
+        
+        for source in watchmode_sources:
+            source_type = source.get("type", "").lower()  # free, subscription, rental, buy
+            platform_name = source.get("name", "")
+            
+            if platform_name:
+                platform_names.add(platform_name)
+            
+            # Determine if we can watch directly (free or subscription)
+            can_watch = source_type in ["free", "subscription"]
+            
+            formatted_sources.append({
+                "platform": platform_name,
+                "type": source_type,
+                "can_watch_directly": can_watch,
+                "web_url": source.get("web_url"),
+                "ios_url": source.get("ios_url"),
+                "android_url": source.get("android_url"),
+                "playstore_url": source.get("android_url"),  # Play Store link
+                "format": source.get("format"),  # sd, hd, 4k
+                "price": source.get("price"),
+                "price_display": f"${source.get('price', 0):.2f}" if source.get("price") else None
+            })
+        
+        # Check if any source allows direct watching
+        can_watch_directly = any(s.get("can_watch_directly") for s in formatted_sources)
+        primary_watch_url = None
+        primary_platform = None
+        
+        if can_watch_directly:
+            # Find the first free or subscription source
+            for source in formatted_sources:
+                if source.get("can_watch_directly"):
+                    primary_watch_url = source.get("web_url") or source.get("android_url") or source.get("ios_url")
+                    primary_platform = source.get("platform")
+                    break
+        
+        return {
+            "can_watch_directly": can_watch_directly,
+            "direct_watch_url": primary_watch_url,
+            "primary_platform": primary_platform,
+            "streaming_sources": formatted_sources,
+            "trailer": trailer,
+            "available_platforms": sorted(list(platform_names)),
+            "platform_count": len(platform_names),
+            "source": "watchmode"  # Currently using WatchMode
+        }
     except HTTPException:
         raise
     except Exception as e:
