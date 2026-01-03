@@ -2701,10 +2701,12 @@ async def get_popular_manga(
         print(f"Manga popular: AniList={len(anilist_manga)}, Kitsu={len(kitsu_manga)}, Gutenberg={len(gutenberg_books)}, Total={len(all_manga)}")
         
         # Always return a valid response structure, even if empty
+        result_count = len(all_manga)
+        print(f"Returning {result_count} manga items (limit={limit})")
         return {
             "Response": "True",
             "Search": all_manga[:limit] if all_manga else [],
-            "totalResults": str(len(all_manga))
+            "totalResults": str(result_count)
         }
     except Exception as e:
         print(f"Error in get_popular_manga: {str(e)}")
@@ -2714,7 +2716,8 @@ async def get_popular_manga(
         return {
             "Response": "True",
             "Search": [],
-            "totalResults": "0"
+            "totalResults": "0",
+            "Error": str(e)
         }
 
 
