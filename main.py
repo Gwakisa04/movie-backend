@@ -41,6 +41,9 @@ ANILIST_BASE_URL = "https://graphql.anilist.co"
 # Kitsu API Configuration (for manga - Free, no API key required)
 KITSU_BASE_URL = "https://kitsu.io/api/edge"
 
+# Project Gutenberg (Gutendex) API Configuration (for books - Free, no API key required)
+GUTENDEX_BASE_URL = "https://gutendex.com"
+
 # In-memory cache for API responses (in production, use Redis)
 cache = {}
 CACHE_DURATION = timedelta(hours=1)
@@ -1625,6 +1628,172 @@ class KitsuClient:
         await self.client.aclose()
 
 
+class GutenbergClient:
+    """Client for interacting with Gutendex API for Project Gutenberg books (Free, no API key required)"""
+    
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+        self.client = httpx.AsyncClient(
+            timeout=10.0,
+            headers={
+                "accept": "application/json"
+            }
+        )
+    
+    def _normalize_gutenberg_to_omdb_format(self, item: dict) -> dict:
+        """Convert Gutenberg book format to OMDB-like format for consistency"""
+        # Get title
+        title = item.get("title", "")
+        
+        # Get authors
+        authors = item.get("authors", [])
+        author_names = []
+        for author in authors:
+            name = author.get("name", "")
+            if name:
+                author_names.append(name)
+        author_str = ", ".join(author_names) if author_names else "Unknown"
+        
+        # Get cover image (if available)
+        formats = item.get("formats", {})
+        cover_image = formats.get("image/jpeg") or formats.get("image/jpeg;charset=utf-8") or "N/A"
+        
+        # Get subjects/genres
+        subjects = item.get("subjects", [])
+        genres = subjects[:5] if subjects else []  # Limit to 5 subjects
+        
+        # Get languages
+        languages = item.get("languages", [])
+        language = languages[0] if languages else "en"
+        
+        # Get download links
+        download_links = {}
+        if formats.get("text/html"):
+            download_links["html"] = formats.get("text/html")
+        if formats.get("application/epub+zip"):
+            download_links["epub"] = formats.get("application/epub+zip")
+        if formats.get("text/plain"):
+            download_links["txt"] = formats.get("text/plain")
+        
+        # Get year from first published date (if available)
+        # Gutenberg books don't always have publication dates, so we'll use copyright year or leave as N/A
+        year = "N/A"
+        
+        return {
+            "Title": title,
+            "Year": year,
+            "imdbID": f"gutenberg_{item.get('id')}",
+            "Type": "book",
+            "Poster": cover_image,
+            "Plot": f"By {author_str}. {', '.join(genres[:3])}" if genres else f"By {author_str}.",
+            "gutenberg_id": item.get("id"),
+            "authors": author_names,
+            "author": author_str,
+            "subjects": genres,
+            "genres": genres,
+            "languages": languages,
+            "language": language,
+            "download_count": item.get("download_count", 0),
+            "download_links": download_links,
+            "bookshelves": item.get("bookshelves", []),
+            "source": "gutenberg"
+        }
+    
+    async def search_books(self, query: str, limit: int = 20, offset: int = 0) -> List[dict]:
+        """Search for books on Gutendex"""
+        cache_key = f"gutenberg_search:{query}:{limit}:{offset}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            url = f"{self.base_url}/books"
+            params = {
+                "search": query,
+                "languages": "en",  # Filter to English books
+                "page": (offset // limit) + 1
+            }
+            
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            books_list = data.get("results", [])
+            
+            # Normalize results
+            normalized_results = []
+            for item in books_list[:limit]:
+                normalized_results.append(self._normalize_gutenberg_to_omdb_format(item))
+            
+            # Cache the response
+            cache[cache_key] = (normalized_results, datetime.now())
+            
+            return normalized_results
+        except httpx.HTTPError as e:
+            print(f"Gutendex API error: {str(e)}")
+            return []
+    
+    async def get_popular_books(self, limit: int = 20, offset: int = 0) -> List[dict]:
+        """Get popular books from Gutendex (sorted by download count)"""
+        cache_key = f"gutenberg_popular:{limit}:{offset}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            # Get multiple pages and sort by download count
+            all_books = []
+            pages_to_fetch = (limit // 32) + 1  # Gutendex returns ~32 books per page
+            
+            tasks = []
+            for page in range(1, pages_to_fetch + 1):
+                url = f"{self.base_url}/books"
+                params = {
+                    "languages": "en",
+                    "page": page
+                }
+                tasks.append(self.client.get(url, params=params))
+            
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for response in responses:
+                if isinstance(response, Exception):
+                    continue
+                try:
+                    data = response.json()
+                    books_list = data.get("results", [])
+                    all_books.extend(books_list)
+                except:
+                    continue
+            
+            # Sort by download count (descending) and take top results
+            all_books.sort(key=lambda x: x.get("download_count", 0), reverse=True)
+            top_books = all_books[:limit]
+            
+            # Normalize results
+            normalized_results = []
+            for item in top_books:
+                normalized_results.append(self._normalize_gutenberg_to_omdb_format(item))
+            
+            # Cache the response
+            cache[cache_key] = (normalized_results, datetime.now())
+            
+            return normalized_results
+        except httpx.HTTPError as e:
+            print(f"Gutendex API error: {str(e)}")
+            return []
+    
+    async def close(self):
+        """Close the HTTP client"""
+        await self.client.aclose()
+
+
 def merge_movie_results(omdb_movies: List[dict], tmdb_movies: List[dict], tvmaze_shows: List[dict] = None, anilist_items: List[dict] = None, limit: int = 20) -> List[dict]:
     """Merge and deduplicate movie/anime/manga results from all APIs"""
     seen_titles = set()
@@ -1678,12 +1847,14 @@ tvmaze_client = None
 watchmode_client = None
 youtube_client = None
 anilist_client = None
+kitsu_client = None
+gutenberg_client = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    global omdb_client, tmdb_client, tvmaze_client, watchmode_client, youtube_client, anilist_client, kitsu_client
+    global omdb_client, tmdb_client, tvmaze_client, watchmode_client, youtube_client, anilist_client, kitsu_client, gutenberg_client
     omdb_client = OMDBClient(OMDB_API_KEY, OMDB_BASE_URL)
     tmdb_client = TMDBClient(TMDB_ACCESS_TOKEN, TMDB_BASE_URL)
     tvmaze_client = TVMazeClient(TVMAZE_BASE_URL)
@@ -1691,6 +1862,7 @@ async def lifespan(app: FastAPI):
     youtube_client = YouTubeClient(YOUTUBE_API_KEY, YOUTUBE_BASE_URL)
     anilist_client = AniListClient(ANILIST_BASE_URL)
     kitsu_client = KitsuClient(KITSU_BASE_URL)
+    gutenberg_client = GutenbergClient(GUTENDEX_BASE_URL)
     yield
     # Shutdown
     if omdb_client:
@@ -1707,6 +1879,8 @@ async def lifespan(app: FastAPI):
         await anilist_client.close()
     if kitsu_client:
         await kitsu_client.close()
+    if gutenberg_client:
+        await gutenberg_client.close()
 
 
 app = FastAPI(
@@ -2156,16 +2330,20 @@ async def search_manga(
     page: int = Query(1, ge=1, description="Page number"),
     limit: int = Query(20, ge=1, le=50, description="Results per page")
 ):
-    """Search for manga using AniList and Kitsu APIs"""
+    """Search for manga using AniList, Kitsu, and Gutenberg APIs"""
     try:
-        # Fetch from both APIs concurrently
+        # Fetch from all three APIs concurrently
         offset = (page - 1) * limit
-        anilist_task = anilist_client.search_manga(query, page, per_page=limit // 2)
-        kitsu_task = kitsu_client.search_manga(query, limit // 2, offset)
+        per_source = limit // 3  # Divide limit among 3 sources
         
-        anilist_result, kitsu_manga = await asyncio.gather(
+        anilist_task = anilist_client.search_manga(query, page, per_page=per_source)
+        kitsu_task = kitsu_client.search_manga(query, per_source, offset)
+        gutenberg_task = gutenberg_client.search_books(query, per_source, offset)
+        
+        anilist_result, kitsu_manga, gutenberg_books = await asyncio.gather(
             anilist_task,
             kitsu_task,
+            gutenberg_task,
             return_exceptions=True
         )
         
@@ -2177,8 +2355,15 @@ async def search_manga(
         if isinstance(kitsu_manga, Exception):
             kitsu_manga = []
         
+        if isinstance(gutenberg_books, Exception):
+            print(f"Gutenberg error: {gutenberg_books}")
+            gutenberg_books = []
+        elif not isinstance(gutenberg_books, list):
+            print(f"Gutenberg returned unexpected type: {type(gutenberg_books)}")
+            gutenberg_books = []
+        
         # Merge results
-        all_manga = anilist_manga + kitsu_manga
+        all_manga = anilist_manga + kitsu_manga + gutenberg_books
         
         return {
             "Response": "True",
@@ -2193,15 +2378,19 @@ async def search_manga(
 async def get_popular_manga(
     limit: int = Query(50, ge=1, le=100, description="Number of results")
 ):
-    """Get popular manga from AniList and Kitsu"""
+    """Get popular manga from AniList, Kitsu, and Gutenberg"""
     try:
-        # Fetch from both APIs concurrently
-        anilist_task = anilist_client.get_popular_manga(limit // 2)
-        kitsu_task = kitsu_client.get_popular_manga(limit // 2)
+        # Fetch from all three APIs concurrently
+        per_source = limit // 3  # Divide limit among 3 sources
         
-        anilist_result, kitsu_manga = await asyncio.gather(
+        anilist_task = anilist_client.get_popular_manga(per_source)
+        kitsu_task = kitsu_client.get_popular_manga(per_source)
+        gutenberg_task = gutenberg_client.get_popular_books(per_source)
+        
+        anilist_result, kitsu_manga, gutenberg_books = await asyncio.gather(
             anilist_task,
             kitsu_task,
+            gutenberg_task,
             return_exceptions=True
         )
         
@@ -2224,10 +2413,17 @@ async def get_popular_manga(
             print(f"Kitsu returned unexpected type: {type(kitsu_manga)}")
             kitsu_manga = []
         
-        # Merge results
-        all_manga = anilist_manga + kitsu_manga
+        if isinstance(gutenberg_books, Exception):
+            print(f"Gutenberg error: {gutenberg_books}")
+            gutenberg_books = []
+        elif not isinstance(gutenberg_books, list):
+            print(f"Gutenberg returned unexpected type: {type(gutenberg_books)}")
+            gutenberg_books = []
         
-        print(f"Manga popular: AniList={len(anilist_manga)}, Kitsu={len(kitsu_manga)}, Total={len(all_manga)}")
+        # Merge results
+        all_manga = anilist_manga + kitsu_manga + gutenberg_books
+        
+        print(f"Manga popular: AniList={len(anilist_manga)}, Kitsu={len(kitsu_manga)}, Gutenberg={len(gutenberg_books)}, Total={len(all_manga)}")
         
         return {
             "Response": "True",
