@@ -2070,11 +2070,11 @@ async def search_movies(
                 return_exceptions=True
             )
         else:
-        omdb_result, tmdb_result = await asyncio.gather(
-            omdb_task,
-            tmdb_task,
-            return_exceptions=True
-        )
+            omdb_result, tmdb_result = await asyncio.gather(
+                omdb_task,
+                tmdb_task,
+                return_exceptions=True
+            )
             tvmaze_result = {"Response": "False", "Search": []}
         
         # Extract movies from all results
