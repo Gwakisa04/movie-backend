@@ -1670,10 +1670,26 @@ class GutenbergClient:
         languages = item.get("languages", [])
         language = languages[0] if languages else "en"
         
-        # Get download links
+        # Get download links and reading URL
         download_links = {}
-        if formats.get("text/html"):
-            download_links["html"] = formats.get("text/html")
+        reading_url = None
+        
+        # Get book ID for constructing reading URL
+        book_id = item.get("id")
+        
+        # Get HTML URL for iframe reading
+        html_url = formats.get("text/html") or formats.get("text/html;charset=utf-8")
+        if html_url:
+            download_links["html"] = html_url
+            # Use the HTML URL directly if it's from Gutenberg
+            if "gutenberg.org" in html_url:
+                reading_url = html_url
+        
+        # Construct Gutenberg reading URL if not set
+        # Gutenberg HTML URLs are typically: https://www.gutenberg.org/files/{id}/{id}-h/{id}-h.htm
+        if not reading_url and book_id:
+            reading_url = f"https://www.gutenberg.org/files/{book_id}/{book_id}-h/{book_id}-h.htm"
+        
         if formats.get("application/epub+zip"):
             download_links["epub"] = formats.get("application/epub+zip")
         if formats.get("text/plain"):
@@ -1699,6 +1715,7 @@ class GutenbergClient:
             "language": language,
             "download_count": item.get("download_count", 0),
             "download_links": download_links,
+            "reading_url": reading_url,  # URL for iframe reading
             "bookshelves": item.get("bookshelves", []),
             "source": "gutenberg"
         }
@@ -2250,8 +2267,22 @@ async def get_movie(
 ):
     """Get movie details by IMDb ID with optional WatchMode and YouTube enrichment"""
     try:
-        result = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=True)
-        if result is None:
+        # Try to get movie from OMDB
+        result = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=False)
+        
+        # If not found in OMDB, try TMDB if it's a TMDB ID
+        if result is None or result.get("Response") == "False":
+            # Check if it's a TMDB ID format
+            if imdb_id.startswith("tmdb_") or imdb_id.isdigit():
+                try:
+                    tmdb_id = int(imdb_id.replace("tmdb_", "")) if imdb_id.startswith("tmdb_") else int(imdb_id)
+                    tmdb_movie = await tmdb_client.get_movie_by_id(tmdb_id)
+                    if tmdb_movie:
+                        result = tmdb_movie
+                except:
+                    pass
+        
+        if result is None or result.get("Response") == "False":
             raise HTTPException(status_code=404, detail="Movie not found")
         
         # Enrich with WatchMode data if requested
@@ -2274,6 +2305,12 @@ async def get_movie(
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Error in get_movie: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        # Return 404 instead of 500 if it's a not found error
+        if "not found" in str(e).lower() or "404" in str(e):
+            raise HTTPException(status_code=404, detail="Movie not found")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2281,50 +2318,57 @@ async def get_movie(
 async def get_movie_streaming(imdb_id: str):
     """Get streaming platform sources for a movie by IMDb ID"""
     try:
-        # First get the movie to get the title
-        movie = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=True)
-        if movie is None:
-            raise HTTPException(status_code=404, detail="Movie not found")
+        # First get the movie to get the title - don't raise error
+        movie = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=False)
+        if movie is None or movie.get("Response") == "False":
+            # Return empty instead of error
+            return {"streaming_sources": [], "trailer": None}
         
         # Search for the movie in WatchMode
         title = movie.get("Title", "")
         if not title:
             return {"streaming_sources": [], "trailer": None}
         
-        watchmode_results = await watchmode_client.search_titles(title)
-        if not watchmode_results:
+        try:
+            watchmode_results = await watchmode_client.search_titles(title)
+            if not watchmode_results:
+                return {"streaming_sources": [], "trailer": None}
+            
+            # Get details and sources
+            title_id = watchmode_results[0].get("id")
+            if not title_id:
+                return {"streaming_sources": [], "trailer": None}
+            
+            details_task = watchmode_client.get_title_details(title_id)
+            sources_task = watchmode_client.get_title_sources(title_id)
+            
+            details, sources = await asyncio.gather(
+                details_task,
+                sources_task,
+                return_exceptions=True
+            )
+            
+            result = {
+                "streaming_sources": [],
+                "trailer": None
+            }
+            
+            if isinstance(details, dict):
+                result["trailer"] = details.get("trailer")
+            
+            if isinstance(sources, list):
+                result["streaming_sources"] = sources
+            
+            return result
+        except Exception as e:
+            print(f"WatchMode error in streaming endpoint: {str(e)}")
             return {"streaming_sources": [], "trailer": None}
-        
-        # Get details and sources
-        title_id = watchmode_results[0].get("id")
-        if not title_id:
-            return {"streaming_sources": [], "trailer": None}
-        
-        details_task = watchmode_client.get_title_details(title_id)
-        sources_task = watchmode_client.get_title_sources(title_id)
-        
-        details, sources = await asyncio.gather(
-            details_task,
-            sources_task,
-            return_exceptions=True
-        )
-        
-        result = {
-            "streaming_sources": [],
-            "trailer": None
-        }
-        
-        if isinstance(details, dict):
-            result["trailer"] = details.get("trailer")
-        
-        if isinstance(sources, list):
-            result["streaming_sources"] = sources
-        
-        return result
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in get_movie_streaming: {str(e)}")
+        # Return empty instead of error
+        return {"streaming_sources": [], "trailer": None}
 
 
 @app.get("/api/movies/{imdb_id}/watch")
@@ -2335,10 +2379,20 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
     Returns: can_watch_directly, direct_watch_url, streaming_sources, platforms
     """
     try:
-        # Get movie details first
-        movie = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=True)
-        if movie is None:
-            raise HTTPException(status_code=404, detail="Movie not found")
+        # Get movie details first - don't raise error, return empty if not found
+        movie = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=False)
+        if movie is None or movie.get("Response") == "False":
+            # Return empty watch options instead of error
+            return {
+                "can_watch_directly": False,
+                "direct_watch_url": None,
+                "primary_platform": None,
+                "streaming_sources": [],
+                "trailer": None,
+                "available_platforms": [],
+                "platform_count": 0,
+                "source": "none"
+            }
         
         title = movie.get("Title", "")
         
@@ -2424,17 +2478,29 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in get_movie_watch_options: {str(e)}")
+        # Return empty watch options instead of error
+        return {
+            "can_watch_directly": False,
+            "direct_watch_url": None,
+            "primary_platform": None,
+            "streaming_sources": [],
+            "trailer": None,
+            "available_platforms": [],
+            "platform_count": 0,
+            "source": "error"
+        }
 
 
 @app.get("/api/movies/{imdb_id}/youtube")
 async def get_movie_youtube(imdb_id: str, include_music: bool = Query(True, description="Include music videos")):
     """Get YouTube videos (trailers and music) for a movie by IMDb ID"""
     try:
-        # First get the movie to get the title
-        movie = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=True)
-        if movie is None:
-            raise HTTPException(status_code=404, detail="Movie not found")
+        # First get the movie to get the title - don't raise error
+        movie = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=False)
+        if movie is None or movie.get("Response") == "False":
+            # Return empty instead of error
+            return {"youtube_trailers": [], "youtube_music_videos": []}
         
         title = movie.get("Title", "")
         year = movie.get("Year", "")
@@ -2443,36 +2509,42 @@ async def get_movie_youtube(imdb_id: str, include_music: bool = Query(True, desc
             return {"youtube_trailers": [], "youtube_music_videos": []}
         
         # Search for trailers and optionally music videos
-        trailers_task = youtube_client.search_trailers(title, year, max_results=5)
-        
-        if include_music:
-            music_query = f"{title} soundtrack {year}" if year else f"{title} soundtrack"
-            music_task = youtube_client.search_music_videos(music_query, max_results=10)
-            trailers, music_videos = await asyncio.gather(
-                trailers_task,
-                music_task,
-                return_exceptions=True
-            )
-        else:
-            trailers = await trailers_task
-            music_videos = []
-        
-        result = {
-            "youtube_trailers": [],
-            "youtube_music_videos": []
-        }
-        
-        if isinstance(trailers, list):
-            result["youtube_trailers"] = trailers
-        
-        if isinstance(music_videos, list):
-            result["youtube_music_videos"] = music_videos
-        
-        return result
+        try:
+            trailers_task = youtube_client.search_trailers(title, year, max_results=5)
+            
+            if include_music:
+                music_query = f"{title} soundtrack {year}" if year else f"{title} soundtrack"
+                music_task = youtube_client.search_music_videos(music_query, max_results=10)
+                trailers, music_videos = await asyncio.gather(
+                    trailers_task,
+                    music_task,
+                    return_exceptions=True
+                )
+            else:
+                trailers = await trailers_task
+                music_videos = []
+            
+            result = {
+                "youtube_trailers": [],
+                "youtube_music_videos": []
+            }
+            
+            if isinstance(trailers, list):
+                result["youtube_trailers"] = trailers
+            
+            if isinstance(music_videos, list):
+                result["youtube_music_videos"] = music_videos
+            
+            return result
+        except Exception as e:
+            print(f"YouTube search error: {str(e)}")
+            return {"youtube_trailers": [], "youtube_music_videos": []}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in get_movie_youtube: {str(e)}")
+        # Return empty instead of error
+        return {"youtube_trailers": [], "youtube_music_videos": []}
 
 
 @app.get("/api/manga/search")
@@ -2598,6 +2670,38 @@ async def get_anime_by_id(anilist_id: int):
         return result
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/books/{gutenberg_id}")
+async def get_book_by_id(gutenberg_id: int):
+    """Get book details by Gutenberg ID with reading URL"""
+    try:
+        # Fetch book details from Gutendex
+        url = f"{GUTENDEX_BASE_URL}/books/{gutenberg_id}"
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+        
+        if not data:
+            raise HTTPException(status_code=404, detail="Book not found")
+        
+        # Normalize to our format
+        book = gutenberg_client._normalize_gutenberg_to_omdb_format(data)
+        
+        # Ensure reading URL is set
+        if not book.get("reading_url") and book.get("gutenberg_id"):
+            book_id = book.get("gutenberg_id")
+            book["reading_url"] = f"https://www.gutenberg.org/files/{book_id}/{book_id}-h/{book_id}-h.htm"
+        
+        return book
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Book not found")
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
