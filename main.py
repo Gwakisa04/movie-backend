@@ -1386,7 +1386,12 @@ class AniListClient:
         if cache_key in cache:
             cached_data, cached_time = cache[cache_key]
             if datetime.now() - cached_time < CACHE_DURATION:
-                return cached_data.get("results", [])[:limit]
+                # Handle both dict and list cache formats
+                if isinstance(cached_data, dict):
+                    return cached_data.get("results", [])[:limit]
+                elif isinstance(cached_data, list):
+                    return cached_data[:limit]
+                return []
         
         graphql_query = """
         query ($page: Int, $perPage: Int) {
@@ -1450,8 +1455,8 @@ class AniListClient:
         for item in media_list:
             normalized_results.append(self._normalize_anilist_to_omdb_format(item, "manga"))
         
-        # Cache the response
-        cache[cache_key] = ({"results": normalized_results}, datetime.now())
+        # Cache the response (store as list for consistency)
+        cache[cache_key] = (normalized_results, datetime.now())
         
         return normalized_results[:limit]
     
@@ -2695,16 +2700,22 @@ async def get_popular_manga(
         
         print(f"Manga popular: AniList={len(anilist_manga)}, Kitsu={len(kitsu_manga)}, Gutenberg={len(gutenberg_books)}, Total={len(all_manga)}")
         
+        # Always return a valid response structure, even if empty
         return {
             "Response": "True",
-            "Search": all_manga[:limit],
+            "Search": all_manga[:limit] if all_manga else [],
             "totalResults": str(len(all_manga))
         }
     except Exception as e:
         print(f"Error in get_popular_manga: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        # Return empty results instead of error to prevent frontend issues
+        return {
+            "Response": "True",
+            "Search": [],
+            "totalResults": "0"
+        }
 
 
 @app.get("/api/anime/{anilist_id}")
