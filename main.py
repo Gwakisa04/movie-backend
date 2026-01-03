@@ -1770,10 +1770,10 @@ class GutenbergClient:
         try:
             # Get multiple pages and sort by download count
             all_books = []
-            pages_to_fetch = (limit // 32) + 1  # Gutendex returns ~32 books per page
+            pages_to_fetch = (limit // 32) + 3  # Gutendex returns ~32 books per page, fetch more pages
             
             tasks = []
-            for page in range(1, pages_to_fetch + 1):
+            for page in range(1, min(pages_to_fetch + 1, 15)):  # Max 15 pages to avoid too many requests
                 url = f"{self.base_url}/books"
                 params = {
                     "languages": "en",
@@ -1790,6 +1790,8 @@ class GutenbergClient:
                     data = response.json()
                     books_list = data.get("results", [])
                     all_books.extend(books_list)
+                    if len(all_books) >= limit * 2:  # Get more than needed for better sorting
+                        break
                 except:
                     continue
             
@@ -2551,13 +2553,14 @@ async def get_movie_youtube(imdb_id: str, include_music: bool = Query(True, desc
 async def search_manga(
     query: str = Query(..., description="Search query for manga"),
     page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(20, ge=1, le=50, description="Results per page")
+    limit: int = Query(200, ge=1, le=300, description="Results per page")
 ):
     """Search for manga using AniList, Kitsu, and Gutenberg APIs"""
     try:
         # Fetch from all three APIs concurrently
         offset = (page - 1) * limit
-        per_source = limit // 3  # Divide limit among 3 sources
+        # Increase per_source to get more results, especially for Gutenberg
+        per_source = (limit // 3) + 20  # Divide limit among 3 sources, add buffer
         
         anilist_task = anilist_client.search_manga(query, page, per_page=per_source)
         kitsu_task = kitsu_client.search_manga(query, per_source, offset)
@@ -2599,12 +2602,13 @@ async def search_manga(
 
 @app.get("/api/manga/popular")
 async def get_popular_manga(
-    limit: int = Query(50, ge=1, le=100, description="Number of results")
+    limit: int = Query(200, ge=1, le=300, description="Number of results")
 ):
     """Get popular manga from AniList, Kitsu, and Gutenberg"""
     try:
         # Fetch from all three APIs concurrently
-        per_source = limit // 3  # Divide limit among 3 sources
+        # Increase per_source to get more results, especially for Gutenberg
+        per_source = (limit // 3) + 20  # Divide limit among 3 sources, add buffer
         
         anilist_task = anilist_client.get_popular_manga(per_source)
         kitsu_task = kitsu_client.get_popular_manga(per_source)
@@ -2692,10 +2696,19 @@ async def get_book_by_id(gutenberg_id: int):
         # Normalize to our format
         book = gutenberg_client._normalize_gutenberg_to_omdb_format(data)
         
-        # Ensure reading URL is set
+        # Ensure reading URL is set - try multiple formats
         if not book.get("reading_url") and book.get("gutenberg_id"):
             book_id = book.get("gutenberg_id")
+            # Standard format
             book["reading_url"] = f"https://www.gutenberg.org/files/{book_id}/{book_id}-h/{book_id}-h.htm"
+        
+        # Also ensure gutenberg_id is set
+        if not book.get("gutenberg_id") and gutenberg_id:
+            book["gutenberg_id"] = gutenberg_id
+        
+        # Ensure source is set
+        book["source"] = "gutenberg"
+        book["Type"] = "book"
         
         return book
     except httpx.HTTPStatusError as e:
