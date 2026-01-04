@@ -42,7 +42,7 @@ ANILIST_BASE_URL = "https://graphql.anilist.co"
 KITSU_BASE_URL = "https://kitsu.io/api/edge"
 
 # Project Gutenberg (Gutendex) API Configuration (for books - Free, no API key required)
-GUTENDEX_BASE_URL = "https://gutendex.com"
+GUTENDEX_BASE_URL = "https://gutendex.com/books/"
 
 # JustWatch API Configuration (for direct watch links and streaming availability)
 JUSTWATCH_BASE_URL = "https://apis.justwatch.com"
@@ -1779,7 +1779,7 @@ class GutenbergClient:
                 return cached_data
         
         try:
-            url = f"{self.base_url}/books"
+            url = self.base_url  # Base URL already includes /books/
             params = {
                 "search": query,
                 "languages": "en",  # Filter to English books
@@ -1822,7 +1822,7 @@ class GutenbergClient:
             
             tasks = []
             for page in range(1, min(pages_to_fetch + 1, 15)):  # Max 15 pages to avoid too many requests
-                url = f"{self.base_url}/books"
+                url = self.base_url  # Base URL already includes /books/
                 params = {
                     "languages": "en",
                     "page": page
@@ -2605,6 +2605,15 @@ async def search_manga(
 ):
     """Search for manga using AniList, Kitsu, and Gutenberg APIs"""
     try:
+        # Check if clients are initialized
+        if not anilist_client or not kitsu_client or not gutenberg_client:
+            print("Warning: Manga clients not initialized")
+            return {
+                "Response": "True",
+                "Search": [],
+                "totalResults": "0"
+            }
+        
         # Fetch from all three APIs concurrently
         offset = (page - 1) * limit
         # Increase per_source to get more results, especially for Gutenberg
@@ -2623,14 +2632,25 @@ async def search_manga(
         
         # Extract manga from AniList result
         anilist_manga = []
-        if isinstance(anilist_result, dict) and anilist_result.get("Response") == "True":
+        if isinstance(anilist_result, Exception):
+            print(f"AniList search error: {anilist_result}")
+            anilist_manga = []
+        elif isinstance(anilist_result, dict) and anilist_result.get("Response") == "True":
             anilist_manga = anilist_result.get("Search", [])
+        elif isinstance(anilist_result, dict):
+            # Sometimes AniList might return data in a different format
+            if "Search" in anilist_result:
+                anilist_manga = anilist_result.get("Search", [])
         
         if isinstance(kitsu_manga, Exception):
+            print(f"Kitsu search error: {kitsu_manga}")
+            kitsu_manga = []
+        elif not isinstance(kitsu_manga, list):
+            print(f"Kitsu returned unexpected type: {type(kitsu_manga)}")
             kitsu_manga = []
         
         if isinstance(gutenberg_books, Exception):
-            print(f"Gutenberg error: {gutenberg_books}")
+            print(f"Gutenberg search error: {gutenberg_books}")
             gutenberg_books = []
         elif not isinstance(gutenberg_books, list):
             print(f"Gutenberg returned unexpected type: {type(gutenberg_books)}")
@@ -2639,13 +2659,23 @@ async def search_manga(
         # Merge results
         all_manga = anilist_manga + kitsu_manga + gutenberg_books
         
+        print(f"Manga search: Query='{query}', AniList={len(anilist_manga)}, Kitsu={len(kitsu_manga)}, Gutenberg={len(gutenberg_books)}, Total={len(all_manga)}")
+        
         return {
             "Response": "True",
             "Search": all_manga[:limit],
             "totalResults": str(len(all_manga))
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in search_manga: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        # Return empty results instead of error to prevent frontend issues
+        return {
+            "Response": "True",
+            "Search": [],
+            "totalResults": "0"
+        }
 
 
 @app.get("/api/manga/popular")
@@ -2654,6 +2684,15 @@ async def get_popular_manga(
 ):
     """Get popular manga from AniList, Kitsu, and Gutenberg"""
     try:
+        # Check if clients are initialized
+        if not anilist_client or not kitsu_client or not gutenberg_client:
+            print("Warning: Manga clients not initialized")
+            return {
+                "Response": "True",
+                "Search": [],
+                "totalResults": "0"
+            }
+        
         # Fetch from all three APIs concurrently
         # Increase per_source to get more results, especially for Gutenberg
         per_source = (limit // 3) + 20  # Divide limit among 3 sources, add buffer
@@ -2676,6 +2715,12 @@ async def get_popular_manga(
         elif isinstance(anilist_result, Exception):
             print(f"AniList error: {anilist_result}")
             anilist_manga = []
+        elif isinstance(anilist_result, dict):
+            # Sometimes AniList might return data in a dict format
+            if "Search" in anilist_result:
+                anilist_manga = anilist_result.get("Search", [])
+            elif "results" in anilist_result:
+                anilist_manga = anilist_result.get("results", [])
         else:
             # Unexpected type
             print(f"AniList returned unexpected type: {type(anilist_result)}")
@@ -2716,7 +2761,7 @@ async def get_popular_manga(
         return {
             "Response": "True",
             "Search": [],
-            "totalResults": "0",
+            "totalResults": "0"
             "Error": str(e)
         }
 
@@ -2740,7 +2785,7 @@ async def get_book_by_id(gutenberg_id: int):
     """Get book details by Gutenberg ID with reading URL"""
     try:
         # Fetch book details from Gutendex
-        url = f"{GUTENDEX_BASE_URL}/books/{gutenberg_id}"
+        url = f"{GUTENDEX_BASE_URL.rstrip('/')}/{gutenberg_id}"
         
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(url)
