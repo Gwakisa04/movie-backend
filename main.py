@@ -2507,10 +2507,29 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
     Returns: can_watch_directly, direct_watch_url, streaming_sources, platforms
     """
     try:
-        # Get movie details first - don't raise error, return empty if not found
-        movie = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=False)
+        # Handle different ID formats - CRITICAL: Check TMDB IDs first!
+        movie = None
+        tmdb_id_from_movie = None
+        
+        if imdb_id.startswith("tmdb_"):
+            # TMDB ID - get from TMDB directly
+            try:
+                tmdb_id_from_movie = int(imdb_id.replace("tmdb_", ""))
+                print(f"✅ TMDB ID detected: {imdb_id} -> {tmdb_id_from_movie}")
+                movie = await tmdb_client.get_movie_by_id(tmdb_id_from_movie, raise_on_error=False)
+                if movie:
+                    print(f"✅ Got movie from TMDB: {movie.get('Title')}")
+            except Exception as e:
+                print(f"❌ Error fetching TMDB movie {tmdb_id_from_movie}: {e}")
+        else:
+            # Try OMDB first (for regular IMDb IDs)
+            movie = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=False)
+            if movie and movie.get("Response") != "False":
+                tmdb_id_from_movie = movie.get("tmdb_id")
+        
+        # If no movie found, return empty
         if movie is None or movie.get("Response") == "False":
-            # Return empty watch options instead of error
+            print(f"⚠️ Movie not found for ID: {imdb_id}")
             return {
                 "can_watch_directly": False,
                 "direct_watch_url": None,
@@ -2523,25 +2542,21 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
             }
         
         title = movie.get("Title", "")
+        print(f"📺 Processing watch options for: {title} (tmdb_id: {tmdb_id_from_movie})")
         
-        # Try to get TMDB ID from multiple sources
-        tmdb_id_from_movie = movie.get("tmdb_id")
+        # Ensure we have TMDB ID - extract from movie if not already set
         if not tmdb_id_from_movie:
-            # Check if imdb_id is actually a TMDB ID
-            if imdb_id.startswith("tmdb_"):
-                try:
-                    tmdb_id_from_movie = int(imdb_id.replace("tmdb_", ""))
-                except:
-                    pass
-            # Also check if movie was enriched with TMDB data
-            if not tmdb_id_from_movie and movie.get("source") == "tmdb":
-                # Extract from imdbID if it's in format tmdb_123
+            tmdb_id_from_movie = movie.get("tmdb_id")
+            # Also check imdbID field in movie object
+            if not tmdb_id_from_movie:
                 imdb_id_str = str(movie.get("imdbID", ""))
                 if imdb_id_str.startswith("tmdb_"):
                     try:
                         tmdb_id_from_movie = int(imdb_id_str.replace("tmdb_", ""))
                     except:
                         pass
+        
+        print(f"🔍 Final tmdb_id_for_providers: {tmdb_id_from_movie}")
         
         # Check JustWatch for direct watch (currently returns fallback)
         justwatch_options = await justwatch_client.get_watch_options(title, imdb_id, country)
@@ -2550,16 +2565,23 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
         watchmode_sources = []
         trailer = None
         
-        # Get TMDB watch providers as fallback/enhancement
+        # Get TMDB watch providers - CRITICAL: This is our primary source!
         tmdb_providers = None
         if tmdb_id_from_movie:
             try:
                 is_tv = movie.get("Type", "").lower() in ["series", "episode"]
+                print(f"🔍 Fetching TMDB watch providers for tmdb_id={tmdb_id_from_movie}, is_tv={is_tv}, country={country}")
                 tmdb_providers = await tmdb_client.get_watch_providers(tmdb_id_from_movie, is_tv=is_tv, country=country)
                 if tmdb_providers:
-                    print(f"TMDB watch providers found for tmdb_id={tmdb_id_from_movie}")
+                    print(f"✅ TMDB watch providers found for tmdb_id={tmdb_id_from_movie}")
+                    results_keys = list(tmdb_providers.get('results', {}).keys())
+                    print(f"   Available countries: {results_keys}")
+                else:
+                    print(f"⚠️ TMDB watch providers returned None for tmdb_id={tmdb_id_from_movie}")
             except Exception as e:
-                print(f"TMDB watch providers error: {str(e)}")
+                print(f"❌ TMDB watch providers error: {str(e)}")
+                import traceback
+                traceback.print_exc()
         elif imdb_id and not imdb_id.startswith("tmdb_") and not imdb_id.startswith("anilist_") and not imdb_id.startswith("tvmaze_"):
             # Try to find TMDB ID by IMDb ID using TMDB's find API
             try:
