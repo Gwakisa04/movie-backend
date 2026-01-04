@@ -2645,6 +2645,53 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
             import traceback
             traceback.print_exc()
         
+        # Helper function to generate platform URLs
+        def get_platform_url(platform_name: str, title: str) -> str:
+            """Generate a URL for a streaming platform"""
+            platform_lower = platform_name.lower().replace(" ", "").replace("+", "plus")
+            
+            # Map common platforms to their URLs
+            platform_urls = {
+                "netflix": f"https://www.netflix.com/search?q={title.replace(' ', '%20')}",
+                "amazonprimevideo": "https://www.primevideo.com",
+                "amazonprime": "https://www.primevideo.com",
+                "disneyplus": "https://www.disneyplus.com",
+                "hulu": "https://www.hulu.com",
+                "hbo": "https://www.hbo.com",
+                "hbomax": "https://www.hbomax.com",
+                "max": "https://www.hbomax.com",
+                "paramountplus": "https://www.paramountplus.com",
+                "peacock": "https://www.peacocktv.com",
+                "appletv": "https://tv.apple.com",
+                "appletv+": "https://tv.apple.com",
+                "youtube": f"https://www.youtube.com/results?search_query={title.replace(' ', '+')}+full+movie",
+                "youtubepremium": f"https://www.youtube.com/results?search_query={title.replace(' ', '+')}+full+movie",
+                "crunchyroll": "https://www.crunchyroll.com",
+                "fubotv": "https://www.fubo.tv",
+                "showtime": "https://www.showtime.com",
+                "starz": "https://www.starz.com",
+                "fxnow": "https://www.fxnetworks.com",
+                "tubi": "https://tubitv.com",
+                "plutotv": "https://pluto.tv",
+                "vudu": "https://www.vudu.com",
+                "googleplay": f"https://play.google.com/store/search?q={title.replace(' ', '%20')}&c=movies",
+                "playstore": f"https://play.google.com/store/search?q={title.replace(' ', '%20')}&c=movies",
+                "itunes": f"https://tv.apple.com/search?term={title.replace(' ', '%20')}",
+                "appstore": f"https://apps.apple.com/us/search?term={title.replace(' ', '%20')}",
+            }
+            
+            # Try exact match first
+            if platform_lower in platform_urls:
+                return platform_urls[platform_lower]
+            
+            # Try partial matches
+            for key, url in platform_urls.items():
+                if key in platform_lower or platform_lower in key:
+                    return url
+            
+            # Default: JustWatch search
+            return f"https://www.justwatch.com/us/search?q={title.replace(' ', '%20')}"
+        
         # Format streaming sources from WatchMode
         formatted_sources = []
         platform_names = set()
@@ -2697,6 +2744,53 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
             
             formatted_sources.append(formatted_source)
         
+        # Helper function to generate platform URLs
+        def get_platform_url(platform_name: str, title: str) -> str:
+            """Generate a URL for a streaming platform"""
+            platform_lower = platform_name.lower().replace(" ", "").replace("+", "plus")
+            
+            # Map common platforms to their URLs
+            platform_urls = {
+                "netflix": f"https://www.netflix.com/search?q={title.replace(' ', '%20')}",
+                "amazonprimevideo": "https://www.primevideo.com",
+                "amazonprime": "https://www.primevideo.com",
+                "disneyplus": "https://www.disneyplus.com",
+                "hulu": "https://www.hulu.com",
+                "hbo": "https://www.hbo.com",
+                "hbomax": "https://www.hbomax.com",
+                "max": "https://www.hbomax.com",
+                "paramountplus": "https://www.paramountplus.com",
+                "peacock": "https://www.peacocktv.com",
+                "appletv": "https://tv.apple.com",
+                "appletv+": "https://tv.apple.com",
+                "youtube": f"https://www.youtube.com/results?search_query={title.replace(' ', '+')}+full+movie",
+                "youtubepremium": f"https://www.youtube.com/results?search_query={title.replace(' ', '+')}+full+movie",
+                "crunchyroll": "https://www.crunchyroll.com",
+                "fubotv": "https://www.fubo.tv",
+                "showtime": "https://www.showtime.com",
+                "starz": "https://www.starz.com",
+                "fxnow": "https://www.fxnetworks.com",
+                "tubi": "https://tubitv.com",
+                "plutotv": "https://pluto.tv",
+                "vudu": "https://www.vudu.com",
+                "googleplay": f"https://play.google.com/store/search?q={title.replace(' ', '%20')}&c=movies",
+                "playstore": f"https://play.google.com/store/search?q={title.replace(' ', '%20')}&c=movies",
+                "itunes": f"https://tv.apple.com/search?term={title.replace(' ', '%20')}",
+                "appstore": f"https://apps.apple.com/us/search?term={title.replace(' ', '%20')}",
+            }
+            
+            # Try exact match first
+            if platform_lower in platform_urls:
+                return platform_urls[platform_lower]
+            
+            # Try partial matches
+            for key, url in platform_urls.items():
+                if key in platform_lower or platform_lower in key:
+                    return url
+            
+            # Default: JustWatch search
+            return f"https://www.justwatch.com/us/search?q={title.replace(' ', '%20')}"
+        
         # Add TMDB watch providers if available (merge with WatchMode results)
         if tmdb_providers:
             # TMDB structure: {results: {US: {flatrate: [...], rent: [...], buy: [...]}}}
@@ -2708,14 +2802,18 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
                 provider_name = provider.get("provider_name", "")
                 if provider_name and provider_name not in platform_names:
                     platform_names.add(provider_name)
+                    platform_url = get_platform_url(provider_name, title)
                     formatted_sources.append({
                         "platform": provider_name,
+                        "name": provider_name,
                         "type": "subscription",
                         "can_watch_directly": True,
-                        "web_url": None,  # TMDB doesn't provide direct URLs
-                        "ios_url": None,
-                        "android_url": None,
-                        "playstore_url": None,
+                        "web_url": platform_url,
+                        "direct_watch_url": platform_url,
+                        "url": platform_url,
+                        "ios_url": platform_url,
+                        "android_url": platform_url,
+                        "playstore_url": platform_url,
                         "format": None,
                         "price": None,
                         "price_display": None,
@@ -2730,14 +2828,18 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
                 provider_name = provider.get("provider_name", "")
                 if provider_name and provider_name not in platform_names:
                     platform_names.add(provider_name)
+                    platform_url = get_platform_url(provider_name, title)
                     formatted_sources.append({
                         "platform": provider_name,
+                        "name": provider_name,
                         "type": "rental",
                         "can_watch_directly": False,
-                        "web_url": None,
-                        "ios_url": None,
-                        "android_url": None,
-                        "playstore_url": None,
+                        "web_url": platform_url,
+                        "direct_watch_url": platform_url,
+                        "url": platform_url,
+                        "ios_url": platform_url,
+                        "android_url": platform_url,
+                        "playstore_url": platform_url,
                         "format": None,
                         "price": None,
                         "price_display": None,
@@ -2752,14 +2854,18 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
                 provider_name = provider.get("provider_name", "")
                 if provider_name and provider_name not in platform_names:
                     platform_names.add(provider_name)
+                    platform_url = get_platform_url(provider_name, title)
                     formatted_sources.append({
                         "platform": provider_name,
+                        "name": provider_name,
                         "type": "buy",
                         "can_watch_directly": False,
-                        "web_url": None,
-                        "ios_url": None,
-                        "android_url": None,
-                        "playstore_url": None,
+                        "web_url": platform_url,
+                        "direct_watch_url": platform_url,
+                        "url": platform_url,
+                        "ios_url": platform_url,
+                        "android_url": platform_url,
+                        "playstore_url": platform_url,
                         "format": None,
                         "price": None,
                         "price_display": None,
@@ -2774,14 +2880,18 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
                 provider_name = provider.get("provider_name", "")
                 if provider_name and provider_name not in platform_names:
                     platform_names.add(provider_name)
+                    platform_url = get_platform_url(provider_name, title)
                     formatted_sources.append({
                         "platform": provider_name,
+                        "name": provider_name,
                         "type": "free",
                         "can_watch_directly": True,
-                        "web_url": None,
-                        "ios_url": None,
-                        "android_url": None,
-                        "playstore_url": None,
+                        "web_url": platform_url,
+                        "direct_watch_url": platform_url,
+                        "url": platform_url,
+                        "ios_url": platform_url,
+                        "android_url": platform_url,
+                        "playstore_url": platform_url,
                         "format": None,
                         "price": None,
                         "price_display": None,
