@@ -2561,7 +2561,7 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
                 
                 # If no IMDb match, use first result
                 if not title_id:
-                title_id = watchmode_results[0].get("id")
+                    title_id = watchmode_results[0].get("id")
                     print(f"Using first search result: title_id={title_id}, imdb_id={watchmode_results[0].get('imdb_id')}")
                 
                 if title_id:
@@ -2868,7 +2868,7 @@ async def search_manga(
         elif isinstance(anilist_result, dict):
             # Sometimes AniList might return data in a different format
             if "Search" in anilist_result:
-            anilist_manga = anilist_result.get("Search", [])
+                anilist_manga = anilist_result.get("Search", [])
         
         if isinstance(kitsu_manga, Exception):
             print(f"Kitsu search error: {kitsu_manga}")
@@ -3028,7 +3028,7 @@ async def get_book_by_id(gutenberg_id: int):
         
         # Normalize to our format - use global client if available, otherwise create temp instance
         if gutenberg_client:
-        book = gutenberg_client._normalize_gutenberg_to_omdb_format(data)
+            book = gutenberg_client._normalize_gutenberg_to_omdb_format(data)
         else:
             # Create temporary client for normalization
             temp_client = GutenbergClient(GUTENDEX_BASE_URL)
@@ -3043,7 +3043,7 @@ async def get_book_by_id(gutenberg_id: int):
             book_id = book.get("gutenberg_id") or gutenberg_id
             if book_id:
                 # Try standard format first
-            book["reading_url"] = f"https://www.gutenberg.org/files/{book_id}/{book_id}-h/{book_id}-h.htm"
+                book["reading_url"] = f"https://www.gutenberg.org/files/{book_id}/{book_id}-h/{book_id}-h.htm"
         
         # Also ensure download_links has html if we have a reading_url
         if book.get("reading_url") and not book.get("download_links", {}).get("html"):
