@@ -2659,11 +2659,18 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
             # Determine if we can watch directly (free or subscription)
             can_watch = source_type in ["free", "subscription"]
             
-            formatted_sources.append({
+            # Check if WatchMode source is YouTube
+            web_url = source.get("web_url") or source.get("url")
+            is_youtube_watchmode = web_url and ("youtube.com" in str(web_url) or "youtu.be" in str(web_url))
+            
+            formatted_source = {
                 "platform": platform_name,
+                "name": platform_name,
                 "type": source_type,
                 "can_watch_directly": can_watch,
-                "web_url": source.get("web_url"),
+                "web_url": web_url,
+                "direct_watch_url": web_url,
+                "url": web_url,
                 "ios_url": source.get("ios_url"),
                 "android_url": source.get("android_url"),
                 "playstore_url": source.get("android_url"),  # Play Store link
@@ -2671,7 +2678,24 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
                 "price": source.get("price"),
                 "price_display": f"${source.get('price', 0):.2f}" if source.get("price") else None,
                 "source": "watchmode"
-            })
+            }
+            
+            # If WatchMode source is YouTube, add YouTube metadata
+            if is_youtube_watchmode:
+                import re
+                video_id_match = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/|embed/)([^&\s]+)', str(web_url))
+                if video_id_match:
+                    video_id = video_id_match.group(1).split('&')[0].split('?')[0]
+                    formatted_source.update({
+                        "source": "youtube",
+                        "youtube_video_id": video_id,
+                        "youtube_embed_url": f"https://www.youtube.com/embed/{video_id}",
+                        "platform": "YouTube",
+                        "name": "YouTube"
+                    })
+                    platform_names.add("YouTube")
+            
+            formatted_sources.append(formatted_source)
         
         # Add TMDB watch providers if available (merge with WatchMode results)
         if tmdb_providers:
@@ -2771,53 +2795,66 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
         
         # Add YouTube as streaming source if movie is available on YouTube
         # Search for full movie on YouTube (not just trailers)
-        try:
-            year = movie.get("Year", "")
-            youtube_query = f"{title} full movie {year}" if year else f"{title} full movie"
-            youtube_videos = await youtube_client.search_videos(
-                youtube_query, 
-                max_results=3,
-                video_type="video"
-            )
-            
-            # Filter for videos that look like full movies (longer duration, keywords in title)
-            if youtube_videos:
-                for video in youtube_videos:
-                    video_title = video.get("title", "").lower()
-                    video_url = video.get("url")
-                    
-                    # Check if video title suggests it's a full movie (not trailer, clip, etc.)
-                    is_full_movie = (
-                        "full movie" in video_title or
-                        "complete movie" in video_title or
-                        ("movie" in video_title and "trailer" not in video_title and "clip" not in video_title and "scene" not in video_title)
-                    )
-                    
-                    if is_full_movie and video_url and "YouTube" not in [s.get("platform", "") for s in formatted_sources]:
-                        formatted_sources.append({
-                            "platform": "YouTube",
-                            "name": "YouTube",
-                            "type": "free",
-                            "can_watch_directly": True,
-                            "web_url": video_url,
-                            "direct_watch_url": video_url,
-                            "url": video_url,
-                            "android_url": video_url,
-                            "ios_url": video_url,
-                            "playstore_url": video_url,
-                            "format": None,
-                            "price": None,
-                            "price_display": None,
-                            "source": "youtube",
-                            "youtube_video_id": video.get("video_id"),
-                            "youtube_embed_url": video.get("embed_url"),
-                            "youtube_title": video.get("title")
-                        })
-                        platform_names.add("YouTube")
-                        print(f"Added YouTube streaming source: {video.get('title')}")
-                        break  # Only add the first valid full movie
-        except Exception as e:
-            print(f"YouTube search error for streaming: {str(e)}")
+        # Only if we don't already have a YouTube source from WatchMode
+        has_youtube_source = any("YouTube" in str(s.get("platform", "")) or s.get("source") == "youtube" for s in formatted_sources)
+        
+        if not has_youtube_source:
+            try:
+                year = movie.get("Year", "")
+                youtube_query = f"{title} full movie {year}" if year else f"{title} full movie"
+                youtube_videos = await youtube_client.search_videos(
+                    youtube_query, 
+                    max_results=5,  # Search more videos for better matches
+                    video_type="video"
+                )
+                
+                # Filter for videos that look like full movies (longer duration, keywords in title)
+                if youtube_videos:
+                    for video in youtube_videos:
+                        video_title = video.get("title", "").lower()
+                        video_url = video.get("url")
+                        video_id = video.get("video_id")
+                        
+                        if not video_url or not video_id:
+                            continue
+                        
+                        # Check if video title suggests it's a full movie (not trailer, clip, etc.)
+                        is_full_movie = (
+                            "full movie" in video_title or
+                            "complete movie" in video_title or
+                            "full film" in video_title or
+                            ("movie" in video_title and "trailer" not in video_title and 
+                             "clip" not in video_title and "scene" not in video_title and
+                             "teaser" not in video_title and "preview" not in video_title)
+                        )
+                        
+                        if is_full_movie:
+                            formatted_sources.append({
+                                "platform": "YouTube",
+                                "name": "YouTube",
+                                "type": "free",
+                                "can_watch_directly": True,
+                                "web_url": video_url,
+                                "direct_watch_url": video_url,
+                                "url": video_url,
+                                "android_url": video_url,
+                                "ios_url": video_url,
+                                "playstore_url": video_url,
+                                "format": None,
+                                "price": None,
+                                "price_display": None,
+                                "source": "youtube",
+                                "youtube_video_id": video_id,
+                                "youtube_embed_url": video.get("embed_url") or f"https://www.youtube.com/embed/{video_id}",
+                                "youtube_title": video.get("title")
+                            })
+                            platform_names.add("YouTube")
+                            print(f"✅ Added YouTube streaming source: {video.get('title')} (ID: {video_id})")
+                            break  # Only add the first valid full movie
+            except Exception as e:
+                print(f"⚠️ YouTube search error for streaming: {str(e)}")
+        else:
+            print(f"✅ YouTube source already found from WatchMode")
         
         # Check if any source allows direct watching
         can_watch_directly = any(s.get("can_watch_directly") for s in formatted_sources)
@@ -3131,7 +3168,7 @@ async def get_book_by_id(gutenberg_id: int):
         if gutenberg_client:
             book = gutenberg_client._normalize_gutenberg_to_omdb_format(data)
         else:
-            # Create temporary client for normalization
+            # Create temporary client for normalization if global client not available
             temp_client = GutenbergClient(GUTENDEX_BASE_URL)
             book = temp_client._normalize_gutenberg_to_omdb_format(data)
         
