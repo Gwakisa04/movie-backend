@@ -2761,7 +2761,7 @@ async def get_popular_manga(
         return {
             "Response": "True",
             "Search": [],
-            "totalResults": "0"
+            "totalResults": "0",
             "Error": str(e)
         }
 
