@@ -666,6 +666,35 @@ class TVMazeClient:
         except httpx.HTTPError as e:
             return {"Response": "False", "Error": f"TVMaze API error: {str(e)}", "Search": []}
     
+    async def get_show_by_id(self, show_id: int, raise_on_error: bool = False) -> Optional[dict]:
+        """Get TV show details by TVMaze ID"""
+        cache_key = f"tvmaze_show:{show_id}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            url = f"{self.base_url}/shows/{show_id}"
+            response = await self.client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Normalize to OMDB-like format
+            normalized = self._normalize_tvmaze_to_omdb_format(data, item_type="series")
+            normalized["Response"] = "True"
+            
+            # Cache the response
+            cache[cache_key] = (normalized, datetime.now())
+            
+            return normalized
+        except httpx.HTTPError as e:
+            if raise_on_error:
+                raise HTTPException(status_code=404, detail=f"TVMaze show not found: {str(e)}")
+            return None
+    
     async def get_popular_shows(self, limit: int = 20, content_type: Optional[str] = None) -> List[dict]:
         """Get popular TV shows from TVMaze by searching popular terms"""
         if content_type == "movie":
@@ -2322,7 +2351,7 @@ async def get_new_releases(
             # Enrich with full details from OMDB if available (but don't fail if it errors)
             try:
                 if merged_movies:
-                    merged_movies = await omdb_client.enrich_movie_details(merged_movies)
+            merged_movies = await omdb_client.enrich_movie_details(merged_movies)
             except Exception as e:
                 print(f"Error enriching movie details: {str(e)}")
                 # Continue with unenriched movies
@@ -2344,23 +2373,45 @@ async def get_movie(
 ):
     """Get movie details by IMDb ID with optional WatchMode and YouTube enrichment"""
     try:
-        # Try to get movie from OMDB
-        result = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=False)
+        result = None
         
-        # If not found in OMDB, try TMDB if it's a TMDB ID
-        if result is None or result.get("Response") == "False":
-            # Check if it's a TMDB ID format
-            if imdb_id.startswith("tmdb_") or imdb_id.isdigit():
+        # Handle different ID formats
+        if imdb_id.startswith("tmdb_"):
+            # TMDB ID
+            try:
+                tmdb_id = int(imdb_id.replace("tmdb_", ""))
+                result = await tmdb_client.get_movie_by_id(tmdb_id, raise_on_error=False)
+            except (ValueError, Exception) as e:
+                print(f"Error fetching TMDB movie {tmdb_id}: {str(e)}")
+                pass
+        elif imdb_id.startswith("tvmaze_"):
+            # TVMaze ID
+            try:
+                tvmaze_id = int(imdb_id.replace("tvmaze_", ""))
+                result = await tvmaze_client.get_show_by_id(tvmaze_id, raise_on_error=False)
+            except (ValueError, Exception) as e:
+                print(f"Error fetching TVMaze show {tvmaze_id}: {str(e)}")
+                pass
+        elif imdb_id.startswith("anilist_"):
+            # AniList ID - handled separately in frontend
+            raise HTTPException(status_code=404, detail="AniList content handled separately")
+        elif imdb_id.startswith("kitsu_"):
+            # Kitsu ID - not implemented yet
+            raise HTTPException(status_code=404, detail="Kitsu content not yet supported")
+        else:
+            # Try OMDB first (for regular IMDb IDs)
+            result = await omdb_client.get_movie_by_id(imdb_id, raise_on_error=False)
+            
+            # If not found in OMDB, try TMDB if it looks like a numeric ID
+            if (result is None or result.get("Response") == "False") and imdb_id.isdigit():
                 try:
-                    tmdb_id = int(imdb_id.replace("tmdb_", "")) if imdb_id.startswith("tmdb_") else int(imdb_id)
-                    tmdb_movie = await tmdb_client.get_movie_by_id(tmdb_id)
-                    if tmdb_movie:
-                        result = tmdb_movie
-                except:
+                    tmdb_id = int(imdb_id)
+                    result = await tmdb_client.get_movie_by_id(tmdb_id, raise_on_error=False)
+                except (ValueError, Exception):
                     pass
         
         if result is None or result.get("Response") == "False":
-            raise HTTPException(status_code=404, detail="Movie not found")
+            raise HTTPException(status_code=404, detail=f"Movie not found for ID: {imdb_id}")
         
         # Enrich with WatchMode data if requested
         if include_watchmode:
@@ -2561,7 +2612,7 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
                 
                 # If no IMDb match, use first result
                 if not title_id:
-                    title_id = watchmode_results[0].get("id")
+                title_id = watchmode_results[0].get("id")
                     print(f"Using first search result: title_id={title_id}, imdb_id={watchmode_results[0].get('imdb_id')}")
                 
                 if title_id:
@@ -2918,7 +2969,7 @@ async def search_manga(
         elif isinstance(anilist_result, dict):
             # Sometimes AniList might return data in a different format
             if "Search" in anilist_result:
-                anilist_manga = anilist_result.get("Search", [])
+            anilist_manga = anilist_result.get("Search", [])
         
         if isinstance(kitsu_manga, Exception):
             print(f"Kitsu search error: {kitsu_manga}")
@@ -3078,7 +3129,7 @@ async def get_book_by_id(gutenberg_id: int):
         
         # Normalize to our format - use global client if available, otherwise create temp instance
         if gutenberg_client:
-            book = gutenberg_client._normalize_gutenberg_to_omdb_format(data)
+        book = gutenberg_client._normalize_gutenberg_to_omdb_format(data)
         else:
             # Create temporary client for normalization
             temp_client = GutenbergClient(GUTENDEX_BASE_URL)
@@ -3093,7 +3144,7 @@ async def get_book_by_id(gutenberg_id: int):
             book_id = book.get("gutenberg_id") or gutenberg_id
             if book_id:
                 # Try standard format first
-                book["reading_url"] = f"https://www.gutenberg.org/files/{book_id}/{book_id}-h/{book_id}-h.htm"
+            book["reading_url"] = f"https://www.gutenberg.org/files/{book_id}/{book_id}-h/{book_id}-h.htm"
         
         # Also ensure download_links has html if we have a reading_url
         if book.get("reading_url") and not book.get("download_links", {}).get("html"):
