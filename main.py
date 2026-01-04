@@ -515,6 +515,34 @@ class TMDBClient:
         except httpx.HTTPError as e:
             return []
     
+    async def get_watch_providers(self, tmdb_id: int, is_tv: bool = False, country: str = "US") -> Optional[dict]:
+        """Get watch providers (streaming availability) for a movie or TV show"""
+        cache_key = f"tmdb_watch_providers:{tmdb_id}:{is_tv}:{country}"
+        
+        # Check cache
+        if cache_key in cache:
+            cached_data, cached_time = cache[cache_key]
+            if datetime.now() - cached_time < CACHE_DURATION:
+                return cached_data
+        
+        try:
+            content_type = "tv" if is_tv else "movie"
+            url = f"{self.base_url}/{content_type}/{tmdb_id}/watch/providers"
+            params = {}
+            if country:
+                params["watch_region"] = country
+            
+            response = await self.client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Cache the response
+            cache[cache_key] = (data, datetime.now())
+            
+            return data
+        except httpx.HTTPError as e:
+            return None
+    
     async def close(self):
         """Close the HTTP client"""
         await self.client.aclose()
@@ -2446,6 +2474,25 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
         
         title = movie.get("Title", "")
         
+        # Try to get TMDB ID from multiple sources
+        tmdb_id_from_movie = movie.get("tmdb_id")
+        if not tmdb_id_from_movie:
+            # Check if imdb_id is actually a TMDB ID
+            if imdb_id.startswith("tmdb_"):
+                try:
+                    tmdb_id_from_movie = int(imdb_id.replace("tmdb_", ""))
+                except:
+                    pass
+            # Also check if movie was enriched with TMDB data
+            if not tmdb_id_from_movie and movie.get("source") == "tmdb":
+                # Extract from imdbID if it's in format tmdb_123
+                imdb_id_str = str(movie.get("imdbID", ""))
+                if imdb_id_str.startswith("tmdb_"):
+                    try:
+                        tmdb_id_from_movie = int(imdb_id_str.replace("tmdb_", ""))
+                    except:
+                        pass
+        
         # Check JustWatch for direct watch (currently returns fallback)
         justwatch_options = await justwatch_client.get_watch_options(title, imdb_id, country)
         
@@ -2453,10 +2500,71 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
         watchmode_sources = []
         trailer = None
         
+        # Get TMDB watch providers as fallback/enhancement
+        tmdb_providers = None
+        if tmdb_id_from_movie:
+            try:
+                is_tv = movie.get("Type", "").lower() in ["series", "episode"]
+                tmdb_providers = await tmdb_client.get_watch_providers(tmdb_id_from_movie, is_tv=is_tv, country=country)
+                if tmdb_providers:
+                    print(f"TMDB watch providers found for tmdb_id={tmdb_id_from_movie}")
+            except Exception as e:
+                print(f"TMDB watch providers error: {str(e)}")
+        elif imdb_id and not imdb_id.startswith("tmdb_") and not imdb_id.startswith("anilist_") and not imdb_id.startswith("tvmaze_"):
+            # Try to find TMDB ID by IMDb ID using TMDB's find API
+            try:
+                # TMDB find by external ID endpoint
+                find_url = f"{tmdb_client.base_url}/find/{imdb_id}"
+                find_params = {"external_source": "imdb_id"}
+                find_response = await tmdb_client.client.get(find_url, params=find_params)
+                if find_response.status_code == 200:
+                    find_data = find_response.json()
+                    # Check movie results first
+                    movie_results = find_data.get("movie_results", [])
+                    if movie_results:
+                        tmdb_id_from_movie = movie_results[0].get("id")
+                        tmdb_providers = await tmdb_client.get_watch_providers(tmdb_id_from_movie, is_tv=False, country=country)
+                        if tmdb_providers:
+                            print(f"TMDB watch providers found via IMDb ID lookup: tmdb_id={tmdb_id_from_movie}")
+                    else:
+                        # Try TV results
+                        tv_results = find_data.get("tv_results", [])
+                        if tv_results:
+                            tmdb_id_from_movie = tv_results[0].get("id")
+                            tmdb_providers = await tmdb_client.get_watch_providers(tmdb_id_from_movie, is_tv=True, country=country)
+                            if tmdb_providers:
+                                print(f"TMDB watch providers found via IMDb ID lookup (TV): tmdb_id={tmdb_id_from_movie}")
+            except Exception as e:
+                print(f"TMDB find by IMDb ID error: {str(e)}")
+        
         try:
+            # First try searching by title
             watchmode_results = await watchmode_client.search_titles(title)
+            print(f"WatchMode search for '{title}': Found {len(watchmode_results) if watchmode_results else 0} results")
+            
+            # If no results, try with year if available
+            if not watchmode_results and movie.get("Year"):
+                year_query = f"{title} {movie.get('Year')}"
+                watchmode_results = await watchmode_client.search_titles(year_query)
+                print(f"WatchMode search with year '{year_query}': Found {len(watchmode_results) if watchmode_results else 0} results")
+            
             if watchmode_results:
-                title_id = watchmode_results[0].get("id")
+                # Try to find best match by IMDb ID if available
+                title_id = None
+                for result in watchmode_results:
+                    result_imdb = result.get("imdb_id", "")
+                    # Check if IMDb IDs match (handle both with and without 'tt' prefix)
+                    if imdb_id and result_imdb:
+                        if imdb_id.replace("tt", "") == result_imdb.replace("tt", ""):
+                            title_id = result.get("id")
+                            print(f"Found exact IMDb match: {imdb_id} -> WatchMode title_id: {title_id}")
+                            break
+                
+                # If no IMDb match, use first result
+                if not title_id:
+                    title_id = watchmode_results[0].get("id")
+                    print(f"Using first search result: title_id={title_id}, imdb_id={watchmode_results[0].get('imdb_id')}")
+                
                 if title_id:
                     details_task = watchmode_client.get_title_details(title_id)
                     sources_task = watchmode_client.get_title_sources(title_id)
@@ -2467,15 +2575,27 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
                         return_exceptions=True
                     )
                     
-                    if isinstance(details, dict):
+                    if isinstance(details, Exception):
+                        print(f"WatchMode details error: {details}")
+                    elif isinstance(details, dict):
                         trailer = details.get("trailer")
+                        print(f"WatchMode trailer: {trailer is not None}")
                     
-                    if isinstance(sources, list):
+                    if isinstance(sources, Exception):
+                        print(f"WatchMode sources error: {sources}")
+                    elif isinstance(sources, list):
                         watchmode_sources = sources
+                        print(f"WatchMode sources found: {len(watchmode_sources)} platforms")
+                    else:
+                        print(f"WatchMode sources unexpected type: {type(sources)}")
+            else:
+                print(f"No WatchMode results found for movie: {title} (imdb_id: {imdb_id})")
         except Exception as e:
             print(f"WatchMode error: {str(e)}")
+            import traceback
+            traceback.print_exc()
         
-        # Format streaming sources
+        # Format streaming sources from WatchMode
         formatted_sources = []
         platform_names = set()
         
@@ -2499,8 +2619,105 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
                 "playstore_url": source.get("android_url"),  # Play Store link
                 "format": source.get("format"),  # sd, hd, 4k
                 "price": source.get("price"),
-                "price_display": f"${source.get('price', 0):.2f}" if source.get("price") else None
+                "price_display": f"${source.get('price', 0):.2f}" if source.get("price") else None,
+                "source": "watchmode"
             })
+        
+        # Add TMDB watch providers if available (merge with WatchMode results)
+        if tmdb_providers:
+            # TMDB structure: {results: {US: {flatrate: [...], rent: [...], buy: [...]}}}
+            country_data = tmdb_providers.get("results", {}).get(country, {})
+            
+            # Flatrate = subscription streaming
+            flatrate = country_data.get("flatrate", [])
+            for provider in flatrate:
+                provider_name = provider.get("provider_name", "")
+                if provider_name and provider_name not in platform_names:
+                    platform_names.add(provider_name)
+                    formatted_sources.append({
+                        "platform": provider_name,
+                        "type": "subscription",
+                        "can_watch_directly": True,
+                        "web_url": None,  # TMDB doesn't provide direct URLs
+                        "ios_url": None,
+                        "android_url": None,
+                        "playstore_url": None,
+                        "format": None,
+                        "price": None,
+                        "price_display": None,
+                        "source": "tmdb",
+                        "tmdb_provider_id": provider.get("provider_id"),
+                        "logo_path": provider.get("logo_path")
+                    })
+            
+            # Rent = rental streaming
+            rent = country_data.get("rent", [])
+            for provider in rent:
+                provider_name = provider.get("provider_name", "")
+                if provider_name and provider_name not in platform_names:
+                    platform_names.add(provider_name)
+                    formatted_sources.append({
+                        "platform": provider_name,
+                        "type": "rental",
+                        "can_watch_directly": False,
+                        "web_url": None,
+                        "ios_url": None,
+                        "android_url": None,
+                        "playstore_url": None,
+                        "format": None,
+                        "price": None,
+                        "price_display": None,
+                        "source": "tmdb",
+                        "tmdb_provider_id": provider.get("provider_id"),
+                        "logo_path": provider.get("logo_path")
+                    })
+            
+            # Buy = purchase streaming
+            buy = country_data.get("buy", [])
+            for provider in buy:
+                provider_name = provider.get("provider_name", "")
+                if provider_name and provider_name not in platform_names:
+                    platform_names.add(provider_name)
+                    formatted_sources.append({
+                        "platform": provider_name,
+                        "type": "buy",
+                        "can_watch_directly": False,
+                        "web_url": None,
+                        "ios_url": None,
+                        "android_url": None,
+                        "playstore_url": None,
+                        "format": None,
+                        "price": None,
+                        "price_display": None,
+                        "source": "tmdb",
+                        "tmdb_provider_id": provider.get("provider_id"),
+                        "logo_path": provider.get("logo_path")
+                    })
+            
+            # Free = free streaming
+            free = country_data.get("free", [])
+            for provider in free:
+                provider_name = provider.get("provider_name", "")
+                if provider_name and provider_name not in platform_names:
+                    platform_names.add(provider_name)
+                    formatted_sources.append({
+                        "platform": provider_name,
+                        "type": "free",
+                        "can_watch_directly": True,
+                        "web_url": None,
+                        "ios_url": None,
+                        "android_url": None,
+                        "playstore_url": None,
+                        "format": None,
+                        "price": None,
+                        "price_display": None,
+                        "source": "tmdb",
+                        "tmdb_provider_id": provider.get("provider_id"),
+                        "logo_path": provider.get("logo_path")
+                    })
+            
+            if formatted_sources:
+                print(f"Added {len(formatted_sources) - len(watchmode_sources)} TMDB providers")
         
         # Check if any source allows direct watching
         can_watch_directly = any(s.get("can_watch_directly") for s in formatted_sources)
@@ -2515,6 +2732,18 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
                     primary_platform = source.get("platform")
                     break
         
+        # Determine source type
+        source_type = "none"
+        if formatted_sources:
+            has_watchmode = any(s.get("source") == "watchmode" for s in formatted_sources)
+            has_tmdb = any(s.get("source") == "tmdb" for s in formatted_sources)
+            if has_watchmode and has_tmdb:
+                source_type = "watchmode+tmdb"
+            elif has_watchmode:
+                source_type = "watchmode"
+            elif has_tmdb:
+                source_type = "tmdb"
+        
         return {
             "can_watch_directly": can_watch_directly,
             "direct_watch_url": primary_watch_url,
@@ -2523,7 +2752,7 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
             "trailer": trailer,
             "available_platforms": sorted(list(platform_names)),
             "platform_count": len(platform_names),
-            "source": "watchmode"  # Currently using WatchMode
+            "source": source_type
         }
     except HTTPException:
         raise
