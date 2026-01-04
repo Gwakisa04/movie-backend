@@ -2322,7 +2322,7 @@ async def get_new_releases(
             # Enrich with full details from OMDB if available (but don't fail if it errors)
             try:
                 if merged_movies:
-            merged_movies = await omdb_client.enrich_movie_details(merged_movies)
+                    merged_movies = await omdb_client.enrich_movie_details(merged_movies)
             except Exception as e:
                 print(f"Error enriching movie details: {str(e)}")
                 # Continue with unenriched movies
