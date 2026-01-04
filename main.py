@@ -2792,12 +2792,15 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
             return f"https://www.justwatch.com/us/search?q={title.replace(' ', '%20')}"
         
         # Add TMDB watch providers if available (merge with WatchMode results)
-        if tmdb_providers:
+        # Always try to get TMDB providers, even if WatchMode returned results
+        if tmdb_providers and tmdb_providers.get("results"):
             # TMDB structure: {results: {US: {flatrate: [...], rent: [...], buy: [...]}}}
             country_data = tmdb_providers.get("results", {}).get(country, {})
+            print(f"TMDB country data for {country}: {list(country_data.keys())}")
             
             # Flatrate = subscription streaming
             flatrate = country_data.get("flatrate", [])
+            print(f"📺 TMDB flatrate providers: {len(flatrate)} - {[p.get('provider_name') for p in flatrate[:5]]}")
             for provider in flatrate:
                 provider_name = provider.get("provider_name", "")
                 if provider_name and provider_name not in platform_names:
@@ -2990,6 +2993,9 @@ async def get_movie_watch_options(imdb_id: str, country: str = Query("US", descr
                 source_type = "watchmode"
             elif has_tmdb:
                 source_type = "tmdb"
+        
+        # Log final result for debugging
+        print(f"📊 Final watch options: {len(formatted_sources)} sources, platforms: {sorted(list(platform_names))}")
         
         return {
             "can_watch_directly": can_watch_directly,
