@@ -2785,7 +2785,9 @@ async def get_book_by_id(gutenberg_id: int):
     """Get book details by Gutenberg ID with reading URL"""
     try:
         # Fetch book details from Gutendex
+        # GUTENDEX_BASE_URL is "https://gutendex.com/books/", so we need to append the ID
         url = f"{GUTENDEX_BASE_URL.rstrip('/')}/{gutenberg_id}"
+        print(f"Fetching book from: {url}")
         
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(url)
@@ -2793,32 +2795,48 @@ async def get_book_by_id(gutenberg_id: int):
             data = response.json()
         
         if not data:
+            print(f"Book {gutenberg_id} not found - empty response")
             raise HTTPException(status_code=404, detail="Book not found")
         
-        # Normalize to our format
-        book = gutenberg_client._normalize_gutenberg_to_omdb_format(data)
+        # Normalize to our format - use global client if available, otherwise create temp instance
+        if gutenberg_client:
+            book = gutenberg_client._normalize_gutenberg_to_omdb_format(data)
+        else:
+            # Create temporary client for normalization
+            temp_client = GutenbergClient(GUTENDEX_BASE_URL)
+            book = temp_client._normalize_gutenberg_to_omdb_format(data)
+        
+        # Ensure gutenberg_id is set
+        if not book.get("gutenberg_id"):
+            book["gutenberg_id"] = gutenberg_id or data.get("id")
         
         # Ensure reading URL is set - try multiple formats
-        if not book.get("reading_url") and book.get("gutenberg_id"):
-            book_id = book.get("gutenberg_id")
-            # Standard format
-            book["reading_url"] = f"https://www.gutenberg.org/files/{book_id}/{book_id}-h/{book_id}-h.htm"
+        if not book.get("reading_url"):
+            book_id = book.get("gutenberg_id") or gutenberg_id
+            if book_id:
+                # Try standard format first
+                book["reading_url"] = f"https://www.gutenberg.org/files/{book_id}/{book_id}-h/{book_id}-h.htm"
         
-        # Also ensure gutenberg_id is set
-        if not book.get("gutenberg_id") and gutenberg_id:
-            book["gutenberg_id"] = gutenberg_id
+        # Also ensure download_links has html if we have a reading_url
+        if book.get("reading_url") and not book.get("download_links", {}).get("html"):
+            book.setdefault("download_links", {})["html"] = book["reading_url"]
         
-        # Ensure source is set
+        # Ensure source and Type are set
         book["source"] = "gutenberg"
         book["Type"] = "book"
         
+        print(f"Successfully loaded book {gutenberg_id}: {book.get('Title')}")
         return book
     except httpx.HTTPStatusError as e:
+        print(f"HTTP error fetching book {gutenberg_id}: {e.response.status_code} - {e}")
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail="Book not found")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error fetching book: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error in get_book_by_id for {gutenberg_id}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error fetching book: {str(e)}")
 
 
 @app.get("/api/actors/popular")
